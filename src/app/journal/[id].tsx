@@ -1,5 +1,5 @@
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -9,10 +9,19 @@ import { useJournals } from "@/context/journal-context";
 export default function JournalScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
+
   const { getJournal, updateActivity } = useJournals();
 
   const journal = getJournal(id);
   const [selectedDay, setSelectedDay] = useState(0);
+
+  const days = journal?.days ?? [];
+
+  useEffect(() => {
+    if (selectedDay >= days.length) {
+      setSelectedDay(0);
+    }
+  }, [days.length, selectedDay]);
 
   if (!journal) {
     return (
@@ -22,7 +31,7 @@ export default function JournalScreen() {
     );
   }
 
-  const day = journal.days[selectedDay];
+  const day = days[selectedDay];
 
   return (
     <SafeAreaView style={styles.container}>
@@ -36,98 +45,127 @@ export default function JournalScreen() {
         <Text style={styles.destination}>{journal.destination}</Text>
         <Text style={styles.description}>{journal.description}</Text>
 
-        {/* Days */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          style={styles.days}
-        >
-          {journal.days.map((item, index) => (
-            <Pressable
-              key={item.id}
-              onPress={() => setSelectedDay(index)}
-              style={[
-                styles.dayButton,
-                index === selectedDay && styles.activeDay,
-              ]}
+        {days.length > 0 ? (
+          <>
+            {/* Day Selection */}
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.days}
             >
-              <Text
-                style={[
-                  styles.dayNumber,
-                  index === selectedDay && styles.activeText,
-                ]}
-              >
-                DAY {index + 1}
-              </Text>
-
-              <Text
-                style={[
-                  styles.dayTitle,
-                  index === selectedDay && styles.activeText,
-                ]}
-              >
-                {item.title}
-              </Text>
-            </Pressable>
-          ))}
-        </ScrollView>
-
-        {/* Selected day */}
-        <View style={styles.paper}>
-          <Text style={styles.date}>{formatDate(day.date)}</Text>
-          <Text style={styles.dayHeading}>{day.title}</Text>
-          <Text style={styles.dayNotes}>{day.notes}</Text>
-
-          {day.activities.map((activity) => (
-            <Pressable
-              key={activity.id}
-              style={styles.activity}
-              onPress={() =>
-                updateActivity(journal.id, day.id, activity.id, {
-                  completed: !activity.completed,
-                })
-              }
-            >
-              <View
-                style={[styles.checkbox, activity.completed && styles.checked]}
-              >
-                {activity.completed && <Text style={styles.check}>✓</Text>}
-              </View>
-
-              <View style={styles.activityContent}>
-                <View style={styles.timeRow}>
-                  <Text style={styles.time}>{activity.time}</Text>
+              {days.map((item, index) => (
+                <Pressable
+                  key={item.id}
+                  onPress={() => setSelectedDay(index)}
+                  style={[
+                    styles.dayButton,
+                    index === selectedDay && styles.activeDay,
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.dayNumber,
+                      index === selectedDay && styles.activeText,
+                    ]}
+                  >
+                    DAY {index + 1}
+                  </Text>
 
                   <Text
                     style={[
-                      styles.priority,
-                      activity.priority === "High" && styles.highPriority,
+                      styles.dayTitle,
+                      index === selectedDay && styles.activeText,
                     ]}
                   >
-                    {activity.priority}
+                    {item.title}
                   </Text>
-                </View>
+                </Pressable>
+              ))}
+            </ScrollView>
 
-                <Text
-                  style={[
-                    styles.activityTitle,
-                    activity.completed && styles.completed,
-                  ]}
-                >
-                  {activity.title}
-                </Text>
+            {/* Selected Day */}
+            {day ? (
+              <View style={styles.paper}>
+                <Text style={styles.date}>{formatDate(day.date)}</Text>
+                <Text style={styles.dayHeading}>{day.title}</Text>
 
-                <Text style={styles.location}>{activity.location}</Text>
-
-                <Text style={styles.duration}>{activity.duration}</Text>
-
-                {activity.notes ? (
-                  <Text style={styles.notes}>{activity.notes}</Text>
+                {day.notes ? (
+                  <Text style={styles.dayNotes}>{day.notes}</Text>
                 ) : null}
+
+                {day.activities.length > 0 ? (
+                  day.activities.map((activity) => (
+                    <Pressable
+                      key={activity.id}
+                      style={styles.activity}
+                      onPress={() =>
+                        updateActivity(journal.id, day.id, activity.id, {
+                          completed: !activity.completed,
+                        })
+                      }
+                    >
+                      <View
+                        style={[
+                          styles.checkbox,
+                          activity.completed && styles.checked,
+                        ]}
+                      >
+                        {activity.completed && (
+                          <Text style={styles.check}>✓</Text>
+                        )}
+                      </View>
+
+                      <View style={styles.activityContent}>
+                        <View style={styles.timeRow}>
+                          <Text style={styles.time}>{activity.time}</Text>
+
+                          <Text
+                            style={[
+                              styles.priority,
+                              activity.priority === "High" &&
+                                styles.highPriority,
+                            ]}
+                          >
+                            {activity.priority}
+                          </Text>
+                        </View>
+
+                        <Text
+                          style={[
+                            styles.activityTitle,
+                            activity.completed && styles.completed,
+                          ]}
+                        >
+                          {activity.title}
+                        </Text>
+
+                        <Text style={styles.location}>{activity.location}</Text>
+
+                        <Text style={styles.duration}>{activity.duration}</Text>
+
+                        {activity.notes ? (
+                          <Text style={styles.notes}>{activity.notes}</Text>
+                        ) : null}
+                      </View>
+                    </Pressable>
+                  ))
+                ) : (
+                  <Text style={styles.emptyText}>
+                    No activities planned for this day yet.
+                  </Text>
+                )}
               </View>
-            </Pressable>
-          ))}
-        </View>
+            ) : null}
+          </>
+        ) : (
+          <View style={styles.paper}>
+            <Text style={styles.dayHeading}>Your itinerary is empty</Text>
+            <Text style={styles.emptyText}>
+              No itinerary days have been created for this journal yet. Your
+              travel dates can be used to generate them.
+            </Text>
+          </View>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -333,6 +371,13 @@ const styles = StyleSheet.create({
     fontStyle: "italic",
     lineHeight: 16,
     marginTop: 8,
+  },
+
+  emptyText: {
+    color: Colors.secondary,
+    fontSize: 12,
+    lineHeight: 20,
+    marginTop: 12,
   },
 
   error: {

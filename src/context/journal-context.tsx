@@ -1,11 +1,11 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
-    createContext,
-    ReactNode,
-    useContext,
-    useEffect,
-    useMemo,
-    useState,
+  createContext,
+  ReactNode,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
 } from "react";
 
 const STORAGE_KEY = "@offmap/travel-journals";
@@ -261,6 +261,52 @@ const SAMPLE_JOURNAL: TravelJournal = {
   ],
 };
 
+// Generate one empty itinerary day for every date in the trip.
+function createJournalDays(startDate: string, endDate: string): JournalDay[] {
+  const [startYear, startMonth, startDay] = startDate.split("-").map(Number);
+  const [endYear, endMonth, endDay] = endDate.split("-").map(Number);
+
+  const start = new Date(Date.UTC(startYear, startMonth - 1, startDay));
+  const end = new Date(Date.UTC(endYear, endMonth - 1, endDay));
+
+  if (
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    start > end
+  ) {
+    return [];
+  }
+
+  const days: JournalDay[] = [];
+
+  for (
+    let current = new Date(start), index = 0;
+    current <= end;
+    current.setUTCDate(current.getUTCDate() + 1), index++
+  ) {
+    days.push({
+      id: `day-${Date.now()}-${index}`,
+      date: current.toISOString().split("T")[0],
+      title: `Day ${index + 1}`,
+      notes: "",
+      activities: [],
+    });
+  }
+
+  return days;
+}
+
+// Repair older saved journals that do not have itinerary days.
+function migrateJournal(journal: TravelJournal): TravelJournal {
+  return {
+    ...journal,
+    days:
+      Array.isArray(journal.days) && journal.days.length > 0
+        ? journal.days
+        : createJournalDays(journal.startDate, journal.endDate),
+  };
+}
+
 const JournalContext = createContext<JournalContextType | undefined>(undefined);
 
 type JournalProviderProps = {
@@ -271,17 +317,33 @@ export function JournalProvider({ children }: JournalProviderProps) {
   const [journals, setJournals] = useState<TravelJournal[]>([SAMPLE_JOURNAL]);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load saved journals when the app starts.
+  // Load and migrate saved journals when the app starts.
   useEffect(() => {
     async function loadJournals() {
       try {
         const savedData = await AsyncStorage.getItem(STORAGE_KEY);
 
         if (savedData) {
-          setJournals(JSON.parse(savedData));
+          const savedJournals: TravelJournal[] = JSON.parse(savedData);
+
+          // IMPORTANT: Actually use the migrated journals here.
+          const migratedJournals = savedJournals.map(migrateJournal);
+
+          const hasSample = migratedJournals.some(
+            (journal) => journal.id === SAMPLE_JOURNAL.id,
+          );
+
+          setJournals(
+            hasSample
+              ? migratedJournals
+              : [SAMPLE_JOURNAL, ...migratedJournals],
+          );
+        } else {
+          setJournals([SAMPLE_JOURNAL]);
         }
       } catch (error) {
         console.error("Could not load journals:", error);
+        setJournals([SAMPLE_JOURNAL]);
       } finally {
         setIsLoading(false);
       }
@@ -290,7 +352,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
     loadJournals();
   }, []);
 
-  // Save journal changes after the initial loading is complete.
+  // Save journal changes after initial loading.
   useEffect(() => {
     if (isLoading) return;
 
@@ -305,13 +367,14 @@ export function JournalProvider({ children }: JournalProviderProps) {
     saveJournals();
   }, [journals, isLoading]);
 
+  // Create a journal with automatically generated itinerary days.
   function addJournal(journal: NewJournal) {
     const newJournal: TravelJournal = {
       ...journal,
       id: `journal-${Date.now()}`,
       isSample: false,
       createdAt: new Date().toISOString(),
-      days: [],
+      days: createJournalDays(journal.startDate, journal.endDate),
     };
 
     setJournals((current) => [...current, newJournal]);
@@ -336,6 +399,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
     return journals.find((journal) => journal.id === id);
   }
 
+  // Update an existing activity.
   function updateActivity(
     journalId: string,
     dayId: string,
@@ -365,6 +429,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
+  // Add a new activity to a particular day.
   function addActivity(
     journalId: string,
     dayId: string,
@@ -395,6 +460,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
+  // Update notes for a particular day.
   function updateDayNotes(journalId: string, dayId: string, notes: string) {
     setJournals((current) =>
       current.map((journal) => {
