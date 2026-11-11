@@ -4,11 +4,14 @@
  */
 
 import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
 
 export function useTheme() {
-  const scheme = useColorScheme();
-  const theme = scheme === 'dark' ? 'dark' : 'light';
-
-  return Colors[theme];
+  return {
+    text: Colors.primary,
+    textSecondary: Colors.secondary,
+    background: Colors.background,
+    backgroundSelected: "#EFEAE1",
+    backgroundElement: Colors.surface,
+    link: Colors.accent,
+  };
 }
