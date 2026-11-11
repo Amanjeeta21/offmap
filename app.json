@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "offmap",
+    "name": "OFFMAP",
     "slug": "offmap",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,9 +8,13 @@
     "scheme": "offmap",
     "userInterfaceStyle": "automatic",
     "ios": {
+      "bundleIdentifier": "com.amanjeeta.offmap",
+      "buildNumber": "1",
       "icon": "./assets/expo.icon"
     },
     "android": {
+      "package": "com.amanjeeta.offmap",
+      "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -28,7 +32,7 @@
       [
         "expo-splash-screen",
         {
-          "backgroundColor": "#208AEF",
+          "backgroundColor": "#F7F5F0",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
         }
@@ -37,6 +41,16 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {
+        "asyncRoutes": {
+          "web": true
+        }
+      },
+      "eas": {
+        "projectId": "507b967e-5f06-4d9c-971a-5db90a8cbe53"
+      }
     }
   }
 }
