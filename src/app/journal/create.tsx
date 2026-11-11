@@ -2,14 +2,14 @@ import * as ImagePicker from "expo-image-picker";
 import { useRouter } from "expo-router";
 import { useState } from "react";
 import {
-    Alert,
-    Image,
-    Pressable,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  Alert,
+  Image,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -93,14 +93,14 @@ export default function CreateJournalScreen() {
           label="START DATE"
           value={startDate}
           onChangeText={setStartDate}
-          placeholder="12 Dec 2026"
+          placeholder="YYYY-MM-DD (e.g. 2026-12-12)"
         />
 
         <Input
           label="END DATE"
           value={endDate}
           onChangeText={setEndDate}
-          placeholder="15 Dec 2026"
+          placeholder="YYYY-MM-DD (e.g. 2026-12-15)"
         />
 
         <Input
