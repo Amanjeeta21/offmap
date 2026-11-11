@@ -16,10 +16,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Colors, Radius, Spacing } from "@/constants/theme";
 import { Priority, useJournals } from "@/context/journal-context";
-import {
-  getCurrentLocation,
-  UserCoordinates,
-} from "@/services/location-service";
+import { getCurrentLocation } from "@/services/location-service";
 
 type DeadlineFormState = {
   hour: string;
@@ -79,8 +76,6 @@ export default function JournalScreen() {
 
   const [showReplanTooltip, setShowReplanTooltip] = useState(false);
   const [isGettingLocation, setIsGettingLocation] = useState(false);
-  const [userCoordinates, setUserCoordinates] =
-    useState<UserCoordinates | null>(null);
 
   const safeSelectedDay =
     days.length === 0 ? 0 : Math.min(selectedDay, days.length - 1);
@@ -265,9 +260,7 @@ export default function JournalScreen() {
     try {
       setIsGettingLocation(true);
 
-      const coordinates = await getCurrentLocation();
-
-      setUserCoordinates(coordinates);
+      await getCurrentLocation();
 
       Alert.alert(
         "Location acquired",
@@ -288,9 +281,36 @@ export default function JournalScreen() {
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={styles.content}>
-        <Pressable onPress={() => router.back()}>
-          <Text style={styles.back}>← My Travel Journal</Text>
-        </Pressable>
+        {/* Top Header */}
+        <View style={styles.headerRow}>
+          <Pressable onPress={() => router.back()} style={styles.backButton}>
+            <Text style={styles.back}>← My Travel Journal</Text>
+          </Pressable>
+
+          <View style={styles.replanWrapper}>
+            {showReplanTooltip ? (
+              <View style={styles.replanTooltip}>
+                <Text style={styles.replanTooltipText}>Replan my trip</Text>
+              </View>
+            ) : null}
+
+            <Pressable
+              style={[
+                styles.replanButton,
+                isGettingLocation && styles.replanButtonDisabled,
+              ]}
+              onPress={handleReplan}
+              onHoverIn={() => setShowReplanTooltip(true)}
+              onHoverOut={() => setShowReplanTooltip(false)}
+              onLongPress={() => setShowReplanTooltip(true)}
+              disabled={isGettingLocation}
+              accessibilityRole="button"
+              accessibilityLabel="Replan my trip"
+            >
+              <Ionicons name="refresh" size={24} color={Colors.white} />
+            </Pressable>
+          </View>
+        </View>
 
         <Text style={styles.eyebrow}>TRAVEL JOURNAL</Text>
         <Text style={styles.title}>{journal.title}</Text>
@@ -704,35 +724,6 @@ export default function JournalScreen() {
                     </View>
                   )}
                 </View>
-
-                {/* Replan Button */}
-                <View style={styles.replanContainer}>
-                  <View style={styles.replanWrapper}>
-                    {showReplanTooltip ? (
-                      <View style={styles.replanTooltip}>
-                        <Text style={styles.replanTooltipText}>
-                          Replan my trip
-                        </Text>
-                      </View>
-                    ) : null}
-
-                    <Pressable
-                      style={[
-                        styles.replanButton,
-                        isGettingLocation && styles.replanButtonDisabled,
-                      ]}
-                      onPress={handleReplan}
-                      onHoverIn={() => setShowReplanTooltip(true)}
-                      onHoverOut={() => setShowReplanTooltip(false)}
-                      onLongPress={() => setShowReplanTooltip(true)}
-                      disabled={isGettingLocation}
-                      accessibilityRole="button"
-                      accessibilityLabel="Replan my trip"
-                    >
-                      <Ionicons name="refresh" size={24} color={Colors.white} />
-                    </Pressable>
-                  </View>
-                </View>
               </View>
             ) : null}
           </>
@@ -848,10 +839,20 @@ const styles = StyleSheet.create({
     paddingBottom: 50,
   },
 
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 25,
+  },
+
+  backButton: {
+    flex: 1,
+  },
+
   back: {
     color: Colors.accent,
     fontSize: 12,
-    marginBottom: 25,
   },
 
   eyebrow: {
@@ -1441,20 +1442,16 @@ const styles = StyleSheet.create({
 
   // Replan Button
 
-  replanContainer: {
-    alignItems: "flex-end",
-    marginTop: 24,
-  },
-
   replanWrapper: {
     position: "relative",
     alignItems: "center",
+    zIndex: 10,
   },
 
   replanButton: {
-    width: 54,
-    height: 54,
-    borderRadius: 27,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
     backgroundColor: Colors.primary,
     alignItems: "center",
     justifyContent: "center",
@@ -1467,7 +1464,7 @@ const styles = StyleSheet.create({
 
   replanTooltip: {
     position: "absolute",
-    bottom: 64,
+    top: 54,
     right: 0,
     backgroundColor: Colors.primary,
     paddingHorizontal: 13,
@@ -1475,7 +1472,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     minWidth: 125,
     alignItems: "center",
-    zIndex: 10,
+    zIndex: 20,
     elevation: 6,
   },
 
