@@ -28,16 +28,22 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
-      "expo-router",
-      [
-        "expo-splash-screen",
-        {
-          "backgroundColor": "#F7F5F0",
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 76
-        }
-      ]
-    ],
+  "expo-router",
+  [
+    "expo-splash-screen",
+    {
+      "backgroundColor": "#F7F5F0",
+      "image": "./assets/images/splash-icon.png",
+      "imageWidth": 76
+    }
+  ],
+  [
+    "expo-location",
+    {
+      "locationWhenInUsePermission": "Allow OFFMAP to access your location when you tap Replan, so it can find nearby places and plan your itinerary."
+    }
+  ]
+],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true

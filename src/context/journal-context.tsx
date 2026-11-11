@@ -1,3 +1,4 @@
+
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   createContext,
@@ -21,6 +22,8 @@ export type JournalActivity = {
   priority: Priority;
   completed: boolean;
   notes: string;
+  actualStartAt?: string;
+  actualEndAt?: string;
 };
 
 export type JournalDay = {
@@ -29,6 +32,7 @@ export type JournalDay = {
   title: string;
   notes: string;
   activities: JournalActivity[];
+  returnDeadline?: string;
 };
 
 export type TravelJournal = {
@@ -69,12 +73,22 @@ type JournalContextType = {
     activityId: string,
     changes: Partial<JournalActivity>,
   ) => void;
+  startActivity: (
+    journalId: string,
+    dayId: string,
+    activityId: string,
+  ) => boolean;
   addActivity: (
     journalId: string,
     dayId: string,
     activity: Omit<JournalActivity, "id">,
   ) => void;
   updateDayNotes: (journalId: string, dayId: string, notes: string) => void;
+  updateDayDeadline: (
+    journalId: string,
+    dayId: string,
+    returnDeadline: string,
+  ) => void;
 };
 
 const SAMPLE_JOURNAL: TravelJournal = {
@@ -96,6 +110,7 @@ const SAMPLE_JOURNAL: TravelJournal = {
       title: "The City Awakens",
       notes:
         "Start early. Take in the river, walk slowly through the old lanes and leave some time to simply observe the city.",
+      returnDeadline: "21:00",
       activities: [
         {
           id: "v1-1",
@@ -155,6 +170,7 @@ const SAMPLE_JOURNAL: TravelJournal = {
       title: "Temples and Traditions",
       notes:
         "Keep the morning flexible for temple visits. Dress comfortably and allow extra time for queues.",
+      returnDeadline: "20:30",
       activities: [
         {
           id: "v2-1",
@@ -215,6 +231,7 @@ const SAMPLE_JOURNAL: TravelJournal = {
       title: "A Slow Goodbye",
       notes:
         "Keep the final day unhurried. Pick up souvenirs and enjoy one last walk by the river.",
+      returnDeadline: "22:00",
       activities: [
         {
           id: "v3-1",
@@ -296,13 +313,16 @@ function createJournalDays(startDate: string, endDate: string): JournalDay[] {
   return days;
 }
 
-// Repair older saved journals that do not have itinerary days.
+// Repair older saved journals without breaking existing data.
 function migrateJournal(journal: TravelJournal): TravelJournal {
   return {
     ...journal,
     days:
       Array.isArray(journal.days) && journal.days.length > 0
-        ? journal.days
+        ? journal.days.map((day) => ({
+            ...day,
+            returnDeadline: day.returnDeadline ?? undefined,
+          }))
         : createJournalDays(journal.startDate, journal.endDate),
   };
 }
@@ -325,8 +345,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
 
         if (savedData) {
           const savedJournals: TravelJournal[] = JSON.parse(savedData);
-
-          // IMPORTANT: Actually use the migrated journals here.
           const migratedJournals = savedJournals.map(migrateJournal);
 
           const hasSample = migratedJournals.some(
@@ -429,6 +447,41 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
+  // Start an activity if no other activity is currently in progress.
+  function startActivity(
+    journalId: string,
+    dayId: string,
+    activityId: string,
+  ): boolean {
+    const journal = journals.find((item) => item.id === journalId);
+
+    if (!journal) return false;
+
+    const day = journal.days.find((item) => item.id === dayId);
+
+    if (!day) return false;
+
+    const activity = day.activities.find(
+      (item) => item.id === activityId,
+    );
+
+    if (!activity || activity.completed || activity.actualStartAt) {
+      return false;
+    }
+
+    const anotherActivityInProgress = day.activities.some(
+      (item) => item.actualStartAt && !item.actualEndAt,
+    );
+
+    if (anotherActivityInProgress) return false;
+
+    updateActivity(journalId, dayId, activityId, {
+      actualStartAt: new Date().toISOString(),
+    });
+
+    return true;
+  }
+
   // Add a new activity to a particular day.
   function addActivity(
     journalId: string,
@@ -476,6 +529,29 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
+  // Update the return deadline for an individual day.
+  // Store time in 24-hour HH:mm format.
+  function updateDayDeadline(
+    journalId: string,
+    dayId: string,
+    returnDeadline: string,
+  ) {
+    setJournals((current) =>
+      current.map((journal) => {
+        if (journal.id !== journalId) return journal;
+
+        return {
+          ...journal,
+          days: journal.days.map((day) =>
+            day.id === dayId
+              ? { ...day, returnDeadline }
+              : day,
+          ),
+        };
+      }),
+    );
+  }
+
   const value = useMemo(
     () => ({
       journals,
@@ -485,14 +561,18 @@ export function JournalProvider({ children }: JournalProviderProps) {
       deleteJournal,
       getJournal,
       updateActivity,
+      startActivity,
       addActivity,
       updateDayNotes,
+      updateDayDeadline,
     }),
     [journals, isLoading],
   );
 
   return (
-    <JournalContext.Provider value={value}>{children}</JournalContext.Provider>
+    <JournalContext.Provider value={value}>
+      {children}
+    </JournalContext.Provider>
   );
 }
 
