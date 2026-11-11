@@ -59,7 +59,7 @@ export default function ItineraryScreen() {
 
         <View style={styles.divider} />
 
-        <Text style={styles.section}>YOUR NOTEBOOKS</Text>
+        <Text style={styles.section}>YOUR JOURNALS</Text>
 
         {isLoading ? (
           <Text style={styles.message}>Opening your journals...</Text>
