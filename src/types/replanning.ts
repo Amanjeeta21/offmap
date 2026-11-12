@@ -3,8 +3,6 @@ import { JournalActivity } from "@/context/journal-context";
 /**
  * A time window during which a place is available.
  * Times use 24-hour HH:mm format.
- *
- * Example: { opensAt: "09:00", closesAt: "17:00" }
  */
 export type OpeningWindow = {
   opensAt: string;
@@ -15,16 +13,7 @@ export type OpeningWindow = {
  * Activity extended with replanning-specific information.
  */
 export type ReplanningActivity = JournalActivity & {
-  /**
-   * Fixed activities cannot be rescheduled.
-   * Examples: booked flights, trains and confirmed reservations.
-   */
   isFixed?: boolean;
-
-  /**
-   * Opening hours for the activity's location.
-   * If unavailable, the optimizer will not assume the place is closed.
-   */
   openingHours?: OpeningWindow[];
 };
 
@@ -49,7 +38,7 @@ export type ActivityScheduleChange = {
 };
 
 /**
- * An activity that cannot be accommodated in the revised itinerary.
+ * An activity that cannot be accommodated.
  */
 export type UnscheduledActivity = {
   activityId: string;
@@ -59,12 +48,26 @@ export type UnscheduledActivity = {
 };
 
 /**
- * Information about a proposed alternative location.
+ * Information about a nearby alternative location.
  */
 export type AlternativePlace = {
+  id?: number;
   name: string;
   location: string;
+  category?: string;
+  distanceMeters?: number;
+
+  /**
+   * Road travel time from the current location.
+   */
   travelTimeMinutes: number;
+
+  /**
+   * Road travel times from this alternative to other destinations.
+   * Keys are destination location IDs.
+   */
+  travelTimesToDestinations?: Record<string, number>;
+
   reason: string;
   openingHours?: OpeningWindow[];
 };
@@ -99,15 +102,18 @@ export type ReplanningResult = {
  * Input required to replan one itinerary day.
  */
 export type ReplanningInput = {
-  /**
-   * Activities belonging to the selected day.
-   */
   activities: ReplanningActivity[];
+  travelTimes: TravelTimeData[];
 
   /**
-   * Travel durations between activity locations.
+   * Starting location ID in the travel-time matrix.
    */
-  travelTimes: TravelTimeData[];
+  startingLocationId?: string;
+
+  /**
+   * Nearby places that may replace activities that cannot fit.
+   */
+  nearbyAlternatives?: AlternativePlace[];
 
   /**
    * Current local time in HH:mm format.

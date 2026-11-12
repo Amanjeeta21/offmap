@@ -2,7 +2,9 @@ import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
+  Modal,
   NativeScrollEvent,
   NativeSyntheticEvent,
   Pressable,
@@ -17,6 +19,12 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Colors, Radius, Spacing } from "@/constants/theme";
 import { Priority, useJournals } from "@/context/journal-context";
 import { getCurrentLocation } from "@/services/location-service";
+import { replanTrip } from "@/services/replanning/replanning-service";
+import {
+  AlternativePlace,
+  ReplanningActivity,
+  ReplanningResult,
+} from "@/types/replanning";
 
 type DeadlineFormState = {
   hour: string;
@@ -49,6 +57,14 @@ function getDeadlineFormState(day?: {
   };
 }
 
+function getCurrentTime(): string {
+  const now = new Date();
+
+  return `${String(now.getHours()).padStart(2, "0")}:${String(
+    now.getMinutes(),
+  ).padStart(2, "0")}`;
+}
+
 export default function JournalScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -59,6 +75,7 @@ export default function JournalScreen() {
     addActivity,
     startActivity,
     updateDayDeadline,
+    updateAccommodationLocation,
   } = useJournals();
 
   const journal = getJournal(id);
@@ -75,13 +92,25 @@ export default function JournalScreen() {
   const [notes, setNotes] = useState("");
 
   const [showReplanTooltip, setShowReplanTooltip] = useState(false);
-  const [isGettingLocation, setIsGettingLocation] = useState(false);
+  const [isReplanning, setIsReplanning] = useState(false);
+
+  const [showAccommodationEditor, setShowAccommodationEditor] = useState(false);
+  const [accommodationInput, setAccommodationInput] = useState(
+    () => journal?.accommodationLocation ?? "",
+  );
+
+  const [replanningResult, setReplanningResult] =
+    useState<ReplanningResult | null>(null);
+  const [showReplanningPreview, setShowReplanningPreview] = useState(false);
+
+  const [selectedAlternatives, setSelectedAlternatives] = useState<
+    Record<string, AlternativePlace>
+  >({});
 
   const safeSelectedDay =
     days.length === 0 ? 0 : Math.min(selectedDay, days.length - 1);
   const day = days[safeSelectedDay];
 
-  // Return deadline selection.
   const initialDeadline = getDeadlineFormState(days[0]);
   const [deadlineHour, setDeadlineHour] = useState(initialDeadline.hour);
   const [deadlineMinute, setDeadlineMinute] = useState(initialDeadline.minute);
@@ -94,6 +123,7 @@ export default function JournalScreen() {
 
   function syncDeadlineFromDay(nextDay?: { returnDeadline?: string | null }) {
     const nextDeadline = getDeadlineFormState(nextDay);
+
     setDeadlineHour(nextDeadline.hour);
     setDeadlineMinute(nextDeadline.minute);
     setDeadlinePeriod(nextDeadline.period);
@@ -104,9 +134,11 @@ export default function JournalScreen() {
     setSelectedDay(index);
     setShowAddActivity(false);
     syncDeadlineFromDay(days[index]);
+    setReplanningResult(null);
+    setShowReplanningPreview(false);
+    setSelectedAlternatives({});
   }
 
-  // Handle an invalid journal ID.
   if (!journal) {
     return (
       <SafeAreaView style={styles.container}>
@@ -115,7 +147,8 @@ export default function JournalScreen() {
     );
   }
 
-  const currentJournalId: string = journal.id;
+  const currentJournal = journal;
+  const currentJournalId = currentJournal.id;
 
   function resetActivityForm() {
     setTime("");
@@ -126,7 +159,6 @@ export default function JournalScreen() {
     setNotes("");
   }
 
-  // Add a new activity.
   function handleAddActivity() {
     if (!day) return;
 
@@ -156,7 +188,6 @@ export default function JournalScreen() {
     Alert.alert("Activity added", `${addedTitle} was added to ${day.title}.`);
   }
 
-  // Start an activity.
   function handleStartActivity(activityId: string) {
     if (!day) return;
 
@@ -170,7 +201,6 @@ export default function JournalScreen() {
     }
   }
 
-  // Complete an activity and record its finish time.
   function handleCompleteActivity(activityId: string) {
     if (!day) return;
 
@@ -184,7 +214,6 @@ export default function JournalScreen() {
     });
   }
 
-  // Format timestamps for display.
   function formatActualTime(timestamp: string) {
     return new Date(timestamp).toLocaleTimeString("en-IN", {
       hour: "numeric",
@@ -192,10 +221,8 @@ export default function JournalScreen() {
     });
   }
 
-  // Calculate the actual time spent on an activity.
   function getActualDuration(start: string, end: string) {
     const difference = new Date(end).getTime() - new Date(start).getTime();
-
     const totalMinutes = Math.max(0, Math.floor(difference / 60000));
 
     const hours = Math.floor(totalMinutes / 60);
@@ -212,7 +239,6 @@ export default function JournalScreen() {
     return `${minutes} min`;
   }
 
-  // Convert selected 12-hour time into 24-hour HH:mm format.
   function getDeadlineValue() {
     let hours = Number(deadlineHour);
 
@@ -225,7 +251,6 @@ export default function JournalScreen() {
     return `${String(hours).padStart(2, "0")}:${deadlineMinute}`;
   }
 
-  // Save or update the selected day's deadline.
   function handleSaveDeadline() {
     if (!day) return;
 
@@ -235,12 +260,10 @@ export default function JournalScreen() {
     setIsEditingDeadline(false);
   }
 
-  // Open the time selector to change an existing deadline.
   function handleEditDeadline() {
     setIsEditingDeadline(true);
   }
 
-  // Cancel editing and retain the previously saved deadline.
   function handleCancelDeadline() {
     if (!day?.returnDeadline) {
       setDeadlineHour("09");
@@ -253,35 +276,190 @@ export default function JournalScreen() {
     syncDeadlineFromDay(day);
   }
 
-  // Retrieve the user's current location for replanning.
+  function handleSaveAccommodation() {
+    const value = accommodationInput.trim();
+
+    if (!value) {
+      Alert.alert(
+        "Accommodation required",
+        "Enter your hotel, hostel, or accommodation address.",
+      );
+      return;
+    }
+
+    updateAccommodationLocation(currentJournalId, value);
+    setShowAccommodationEditor(false);
+
+    Alert.alert(
+      "Accommodation saved",
+      "Your return location has been updated for this trip.",
+    );
+  }
+
+  function handleCancelAccommodation() {
+    setAccommodationInput(currentJournal.accommodationLocation ?? "");
+    setShowAccommodationEditor(false);
+  }
+
   async function handleReplan() {
-    if (isGettingLocation) return;
+    if (isReplanning) return;
+
+    if (!day) {
+      Alert.alert("No itinerary", "Add an itinerary day before replanning.");
+      return;
+    }
+
+    if (day.activities.length === 0) {
+      Alert.alert(
+        "No activities",
+        "Add some activities to this day before replanning.",
+      );
+      return;
+    }
+
+    if (!currentJournal.accommodationLocation?.trim()) {
+      setAccommodationInput("");
+      setShowAccommodationEditor(true);
+
+      Alert.alert(
+        "Accommodation needed",
+        "Add your accommodation location first. OFFMAP needs it to calculate your return journey.",
+      );
+      return;
+    }
+
+    if (!day.returnDeadline) {
+      Alert.alert(
+        "Return deadline needed",
+        "Save your return deadline before replanning this day.",
+      );
+      return;
+    }
 
     try {
-      setIsGettingLocation(true);
+      setIsReplanning(true);
+      setReplanningResult(null);
+      setSelectedAlternatives({});
 
+      // Check location permission before requesting route information.
       await getCurrentLocation();
 
-      Alert.alert(
-        "Location acquired",
-        "Your current location is ready for itinerary replanning.",
-      );
+      const result = await replanTrip({
+        activities: day.activities as ReplanningActivity[],
+        currentTime: getCurrentTime(),
+        returnDeadline: day.returnDeadline,
+        returnLocation: currentJournal.accommodationLocation,
+      });
+
+      setReplanningResult(result);
+      setShowReplanningPreview(true);
     } catch (error) {
       Alert.alert(
-        "Location unavailable",
+        "Replanning unavailable",
         error instanceof Error
           ? error.message
-          : "Unable to retrieve your location.",
+          : "OFFMAP could not calculate a new itinerary. Please try again.",
       );
     } finally {
-      setIsGettingLocation(false);
+      setIsReplanning(false);
     }
   }
+
+  function handleSelectAlternative(
+    activityId: string,
+    alternative: AlternativePlace,
+  ) {
+    setSelectedAlternatives((current) => ({
+      ...current,
+      [activityId]: alternative,
+    }));
+  }
+
+  function handleDiscardReplanning() {
+    setShowReplanningPreview(false);
+    setReplanningResult(null);
+    setSelectedAlternatives({});
+  }
+
+  function handleAcceptReplanning() {
+    if (!day || !replanningResult) return;
+
+    // Only proposed schedule changes are applied here.
+    // Completed and active activities are not changed.
+    for (const change of replanningResult.changes) {
+      const activity = day.activities.find(
+        (item) => item.id === change.activityId,
+      );
+
+      if (!activity || activity.completed) continue;
+
+      const isInProgress =
+        !!activity.actualStartAt &&
+        !activity.actualEndAt &&
+        !activity.completed;
+
+      if (isInProgress) continue;
+
+      const selectedAlternative = selectedAlternatives[activity.id];
+
+      updateActivity(currentJournalId, day.id, activity.id, {
+        time: change.proposedTime,
+        ...(selectedAlternative
+          ? {
+              title: `Visit ${selectedAlternative.name}`,
+              location: selectedAlternative.location,
+            }
+          : {}),
+      });
+    }
+
+    // Apply a selected nearby replacement even if the original activity
+    // did not receive a schedule change.
+    for (const [activityId, alternative] of Object.entries(
+      selectedAlternatives,
+    )) {
+      const activity = day.activities.find((item) => item.id === activityId);
+
+      if (!activity || activity.completed) continue;
+
+      const isInProgress =
+        !!activity.actualStartAt &&
+        !activity.actualEndAt &&
+        !activity.completed;
+
+      if (isInProgress) continue;
+
+      const hasScheduleChange = replanningResult.changes.some(
+        (change) => change.activityId === activityId,
+      );
+
+      if (!hasScheduleChange) {
+        updateActivity(currentJournalId, day.id, activityId, {
+          title: `Visit ${alternative.name}`,
+          location: alternative.location,
+          time: activity.time,
+        });
+      }
+    }
+
+    setShowReplanningPreview(false);
+    setReplanningResult(null);
+    setSelectedAlternatives({});
+
+    Alert.alert(
+      "Itinerary updated",
+      "Your accepted itinerary changes have been saved.",
+    );
+  }
+
+  const selectedDayChanges = replanningResult?.changes ?? [];
+  const selectedDayUnscheduled = replanningResult?.unscheduledActivities ?? [];
+  const selectedDayAlternatives =
+    replanningResult?.alternativeSuggestions ?? [];
 
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={styles.content}>
-        {/* Top Header */}
         <View style={styles.headerRow}>
           <Pressable onPress={() => router.back()} style={styles.backButton}>
             <Text style={styles.back}>← My Travel Journal</Text>
@@ -297,29 +475,58 @@ export default function JournalScreen() {
             <Pressable
               style={[
                 styles.replanButton,
-                isGettingLocation && styles.replanButtonDisabled,
+                isReplanning && styles.replanButtonDisabled,
               ]}
               onPress={handleReplan}
               onHoverIn={() => setShowReplanTooltip(true)}
               onHoverOut={() => setShowReplanTooltip(false)}
               onLongPress={() => setShowReplanTooltip(true)}
-              disabled={isGettingLocation}
+              disabled={isReplanning}
               accessibilityRole="button"
               accessibilityLabel="Replan my trip"
             >
-              <Ionicons name="refresh" size={24} color={Colors.white} />
+              {isReplanning ? (
+                <ActivityIndicator color={Colors.white} />
+              ) : (
+                <Ionicons name="refresh" size={24} color={Colors.white} />
+              )}
             </Pressable>
           </View>
         </View>
 
         <Text style={styles.eyebrow}>TRAVEL JOURNAL</Text>
-        <Text style={styles.title}>{journal.title}</Text>
-        <Text style={styles.destination}>{journal.destination}</Text>
-        <Text style={styles.description}>{journal.description}</Text>
+        <Text style={styles.title}>{currentJournal.title}</Text>
+        <Text style={styles.destination}>{currentJournal.destination}</Text>
+        <Text style={styles.description}>{currentJournal.description}</Text>
+
+        {/* Accommodation */}
+        <View style={styles.accommodationCard}>
+          <View style={styles.accommodationIcon}>
+            <Ionicons name="bed-outline" size={21} color={Colors.primary} />
+          </View>
+
+          <View style={styles.accommodationContent}>
+            <Text style={styles.accommodationLabel}>YOUR ACCOMMODATION</Text>
+            <Text style={styles.accommodationValue}>
+              {currentJournal.accommodationLocation || "No accommodation added yet"}
+            </Text>
+          </View>
+
+          <Pressable
+            style={styles.accommodationEditButton}
+            onPress={() => {
+              setAccommodationInput(currentJournal.accommodationLocation ?? "");
+              setShowAccommodationEditor(true);
+            }}
+            accessibilityRole="button"
+            accessibilityLabel="Edit accommodation"
+          >
+            <Ionicons name="create-outline" size={19} color={Colors.primary} />
+          </Pressable>
+        </View>
 
         {days.length > 0 ? (
           <>
-            {/* Day Selection */}
             <ScrollView
               horizontal
               showsHorizontalScrollIndicator={false}
@@ -355,7 +562,6 @@ export default function JournalScreen() {
               ))}
             </ScrollView>
 
-            {/* Selected Day */}
             {day ? (
               <View style={styles.paper}>
                 <Text style={styles.date}>{formatDate(day.date)}</Text>
@@ -365,7 +571,6 @@ export default function JournalScreen() {
                   <Text style={styles.dayNotes}>{day.notes}</Text>
                 ) : null}
 
-                {/* Add Activity */}
                 {!showAddActivity ? (
                   <Pressable
                     style={styles.addButton}
@@ -468,7 +673,6 @@ export default function JournalScreen() {
                   </View>
                 )}
 
-                {/* Activities */}
                 {day.activities.length > 0 ? (
                   day.activities.map((activity) => {
                     const isInProgress =
@@ -532,7 +736,6 @@ export default function JournalScreen() {
                             <Text style={styles.notes}>{activity.notes}</Text>
                           ) : null}
 
-                          {/* Actual Activity Tracking */}
                           {activity.actualStartAt ? (
                             <View style={styles.trackingDetails}>
                               <Text style={styles.trackingText}>
@@ -563,7 +766,6 @@ export default function JournalScreen() {
                             </View>
                           ) : null}
 
-                          {/* Start Activity Button */}
                           {!activity.completed && !activity.actualStartAt ? (
                             <Pressable
                               style={styles.startButton}
@@ -575,7 +777,6 @@ export default function JournalScreen() {
                             </Pressable>
                           ) : null}
 
-                          {/* Complete Activity Button */}
                           {isInProgress ? (
                             <Pressable
                               style={styles.completeButton}
@@ -603,7 +804,6 @@ export default function JournalScreen() {
                             </Pressable>
                           ) : null}
 
-                          {/* Completed Status */}
                           {activity.completed ? (
                             <View style={styles.completedBadge}>
                               <Text style={styles.completedBadgeText}>
@@ -639,7 +839,6 @@ export default function JournalScreen() {
                     </View>
                   </View>
 
-                  {/* Saved Deadline */}
                   {day.returnDeadline && !isEditingDeadline ? (
                     <View style={styles.savedDeadlineCard}>
                       <View style={styles.savedDeadlineContent}>
@@ -730,18 +929,302 @@ export default function JournalScreen() {
         ) : (
           <View style={styles.paper}>
             <Text style={styles.dayHeading}>Your itinerary is empty</Text>
-
             <Text style={styles.emptyText}>
               No itinerary days have been created for this journal yet.
             </Text>
           </View>
         )}
       </ScrollView>
+
+      {/* Accommodation editor */}
+      <Modal
+        visible={showAccommodationEditor}
+        transparent
+        animationType="fade"
+        onRequestClose={handleCancelAccommodation}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalEyebrow}>YOUR STAY</Text>
+            <Text style={styles.modalTitle}>Where are you staying?</Text>
+            <Text style={styles.modalDescription}>
+              Enter your hotel name or full address. OFFMAP uses this location
+              to calculate your return journey.
+            </Text>
+
+            <TextInput
+              value={accommodationInput}
+              onChangeText={setAccommodationInput}
+              placeholder="Hotel name, street, city"
+              placeholderTextColor={Colors.muted}
+              style={styles.input}
+              autoCapitalize="words"
+              multiline
+            />
+
+            <View style={styles.modalButtons}>
+              <Pressable
+                style={styles.cancelButton}
+                onPress={handleCancelAccommodation}
+              >
+                <Text style={styles.cancelText}>Cancel</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.saveButton}
+                onPress={handleSaveAccommodation}
+              >
+                <Text style={styles.saveText}>Save location</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Replanning preview */}
+      <Modal
+        visible={showReplanningPreview}
+        transparent
+        animationType="slide"
+        onRequestClose={handleDiscardReplanning}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.previewCard}>
+            <View style={styles.previewHeader}>
+              <View style={styles.previewHeaderContent}>
+                <Text style={styles.modalEyebrow}>OFFMAP ROUTE UPDATE</Text>
+                <Text style={styles.previewTitle}>Your revised day</Text>
+                <Text style={styles.previewSubtitle}>
+                  Review the suggested changes before saving.
+                </Text>
+              </View>
+
+              <Pressable
+                onPress={handleDiscardReplanning}
+                style={styles.closeButton}
+              >
+                <Ionicons name="close" size={22} color={Colors.primary} />
+              </Pressable>
+            </View>
+
+            <ScrollView
+              style={styles.previewScroll}
+              showsVerticalScrollIndicator={false}
+            >
+              {replanningResult ? (
+                <>
+                  <View style={styles.resultSummary}>
+                    <Text style={styles.resultSummaryTitle}>
+                      {replanningResult.isFeasible
+                        ? "Route evaluation complete"
+                        : "Your schedule needs attention"}
+                    </Text>
+                    <Text style={styles.resultSummaryText}>
+                      {replanningResult.explanation}
+                    </Text>
+                  </View>
+
+                  <Text style={styles.previewSectionTitle}>
+                    SCHEDULE CHANGES
+                  </Text>
+
+                  {selectedDayChanges.length > 0 ? (
+                    selectedDayChanges.map((change) => {
+                      const activity = day?.activities.find(
+                        (item) => item.id === change.activityId,
+                      );
+
+                      return (
+                        <View
+                          key={change.activityId}
+                          style={styles.previewItem}
+                        >
+                          <Text style={styles.previewItemTitle}>
+                            {activity?.title ?? "Activity"}
+                          </Text>
+
+                          <View style={styles.changeTimeRow}>
+                            <Text style={styles.oldTime}>
+                              {change.originalTime}
+                            </Text>
+                            <Ionicons
+                              name="arrow-forward"
+                              size={15}
+                              color={Colors.accent}
+                            />
+                            <Text style={styles.newTime}>
+                              {change.proposedTime}
+                            </Text>
+                          </View>
+
+                          <Text style={styles.previewReason}>
+                            {change.reason}
+                          </Text>
+                        </View>
+                      );
+                    })
+                  ) : (
+                    <Text style={styles.previewEmpty}>
+                      No activity timing changes were suggested.
+                    </Text>
+                  )}
+
+                  {selectedDayUnscheduled.length > 0 ? (
+                    <>
+                      <Text style={styles.previewSectionTitle}>
+                        ACTIVITIES THAT COULD NOT FIT
+                      </Text>
+
+                      {selectedDayUnscheduled.map((item) => (
+                        <View key={item.activityId} style={styles.warningItem}>
+                          <Text style={styles.previewItemTitle}>
+                            {item.title}
+                          </Text>
+                          <Text style={styles.previewReason}>
+                            {item.reason}
+                          </Text>
+                        </View>
+                      ))}
+                    </>
+                  ) : null}
+
+                  {selectedDayAlternatives.length > 0 ? (
+                    <>
+                      <Text style={styles.previewSectionTitle}>
+                        NEARBY ALTERNATIVES
+                      </Text>
+
+                      {selectedDayAlternatives.map((suggestion) => (
+                        <View
+                          key={suggestion.activityId}
+                          style={styles.alternativeGroup}
+                        >
+                          <Text style={styles.previewItemTitle}>
+                            Instead of: {suggestion.originalTitle}
+                          </Text>
+
+                          {suggestion.alternatives.length > 0 ? (
+                            suggestion.alternatives.map((alternative) => {
+                              const isSelected =
+                                selectedAlternatives[suggestion.activityId]
+                                  ?.name === alternative.name;
+
+                              return (
+                                <Pressable
+                                  key={`${suggestion.activityId}-${alternative.name}`}
+                                  style={[
+                                    styles.alternativeItem,
+                                    isSelected &&
+                                      styles.selectedAlternativeItem,
+                                  ]}
+                                  onPress={() =>
+                                    handleSelectAlternative(
+                                      suggestion.activityId,
+                                      alternative,
+                                    )
+                                  }
+                                >
+                                  <View style={styles.alternativeText}>
+                                    <Text style={styles.alternativeName}>
+                                      {alternative.name}
+                                    </Text>
+                                    <Text style={styles.previewReason}>
+                                      {alternative.reason}
+                                    </Text>
+                                    <Text style={styles.alternativeTravel}>
+                                      {alternative.travelTimeMinutes} min travel
+                                      time
+                                    </Text>
+                                  </View>
+
+                                  <Ionicons
+                                    name={
+                                      isSelected
+                                        ? "checkmark-circle"
+                                        : "ellipse-outline"
+                                    }
+                                    size={22}
+                                    color={
+                                      isSelected
+                                        ? Colors.success
+                                        : Colors.secondary
+                                    }
+                                  />
+                                </Pressable>
+                              );
+                            })
+                          ) : (
+                            <Text style={styles.previewEmpty}>
+                              No suitable nearby alternative was found.
+                            </Text>
+                          )}
+                        </View>
+                      ))}
+                    </>
+                  ) : null}
+
+                  {replanningResult.warnings.length > 0 ? (
+                    <>
+                      <Text style={styles.previewSectionTitle}>NOTES</Text>
+
+                      {replanningResult.warnings.map((warning, index) => (
+                        <View
+                          key={`${index}-${warning}`}
+                          style={styles.warningItem}
+                        >
+                          <Ionicons
+                            name="alert-circle-outline"
+                            size={17}
+                            color={Colors.accent}
+                          />
+                          <Text style={styles.previewReason}>{warning}</Text>
+                        </View>
+                      ))}
+                    </>
+                  ) : null}
+
+                  {replanningResult.totalDelayMinutes > 0 ? (
+                    <Text style={styles.delayText}>
+                      Estimated schedule delay:{" "}
+                      {replanningResult.totalDelayMinutes} minutes
+                    </Text>
+                  ) : null}
+
+                  <Text style={styles.previewFootnote}>
+                    Your original itinerary remains unchanged until you accept
+                    these suggestions.
+                  </Text>
+                </>
+              ) : null}
+            </ScrollView>
+
+            <View style={styles.previewActions}>
+              <Pressable
+                style={styles.previewDiscardButton}
+                onPress={handleDiscardReplanning}
+              >
+                <Text style={styles.previewDiscardText}>Discard</Text>
+              </Pressable>
+
+              <Pressable
+                style={styles.previewAcceptButton}
+                onPress={handleAcceptReplanning}
+                disabled={
+                  !replanningResult ||
+                  (selectedDayChanges.length === 0 &&
+                    Object.keys(selectedAlternatives).length === 0)
+                }
+              >
+                <Text style={styles.previewAcceptText}>Accept changes</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-// Custom scroll-wheel picker.
 type WheelPickerProps = {
   values: string[];
   selectedValue: string;
@@ -833,58 +1316,48 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: Colors.background,
   },
-
   content: {
     padding: Spacing.lg,
     paddingBottom: 50,
   },
-
   headerRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
     marginBottom: 25,
   },
-
   backButton: {
     flex: 1,
   },
-
   back: {
     color: Colors.accent,
     fontSize: 12,
   },
-
   eyebrow: {
     color: Colors.accent,
     fontSize: 9,
     letterSpacing: 2,
   },
-
   title: {
     color: Colors.primary,
     fontFamily: "Georgia",
     fontSize: 30,
     marginTop: 8,
   },
-
   destination: {
     color: Colors.secondary,
     fontSize: 12,
     marginTop: 5,
   },
-
   description: {
     color: Colors.secondary,
     fontSize: 12,
     fontStyle: "italic",
     marginTop: 12,
   },
-
   days: {
     marginVertical: 25,
   },
-
   dayButton: {
     padding: 12,
     marginRight: 10,
@@ -893,28 +1366,23 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     backgroundColor: Colors.surface,
   },
-
   activeDay: {
     backgroundColor: Colors.primary,
     borderColor: Colors.primary,
   },
-
   dayNumber: {
     color: Colors.secondary,
     fontSize: 9,
     fontWeight: "700",
   },
-
   dayTitle: {
     color: Colors.primary,
     fontSize: 11,
     marginTop: 4,
   },
-
   activeText: {
     color: Colors.white,
   },
-
   paper: {
     backgroundColor: "#FFFDF8",
     borderRadius: Radius.md,
@@ -922,21 +1390,18 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
   },
-
   date: {
     color: Colors.accent,
     fontSize: 10,
     fontWeight: "700",
     letterSpacing: 1,
   },
-
   dayHeading: {
     color: Colors.primary,
     fontFamily: "Georgia",
     fontSize: 24,
     marginTop: 7,
   },
-
   dayNotes: {
     color: Colors.secondary,
     fontSize: 12,
@@ -944,7 +1409,6 @@ const styles = StyleSheet.create({
     marginTop: 10,
     marginBottom: 20,
   },
-
   addButton: {
     marginTop: 20,
     marginBottom: 5,
@@ -954,14 +1418,12 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     alignItems: "center",
   },
-
   addButtonText: {
     color: Colors.accent,
     fontSize: 10,
     fontWeight: "700",
     letterSpacing: 1,
   },
-
   form: {
     marginTop: 20,
     padding: 16,
@@ -970,14 +1432,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
   },
-
   formTitle: {
     color: Colors.primary,
     fontFamily: "Georgia",
     fontSize: 20,
     marginBottom: 18,
   },
-
   label: {
     color: Colors.secondary,
     fontSize: 9,
@@ -986,7 +1446,6 @@ const styles = StyleSheet.create({
     marginTop: 12,
     marginBottom: 6,
   },
-
   input: {
     backgroundColor: Colors.surface,
     borderWidth: 1,
@@ -997,17 +1456,14 @@ const styles = StyleSheet.create({
     color: Colors.primary,
     fontSize: 12,
   },
-
   notesInput: {
     minHeight: 80,
     textAlignVertical: "top",
   },
-
   priorityRow: {
     flexDirection: "row",
     gap: 8,
   },
-
   priorityButton: {
     paddingVertical: 9,
     paddingHorizontal: 14,
@@ -1016,27 +1472,22 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     backgroundColor: Colors.surface,
   },
-
   selectedPriority: {
     backgroundColor: Colors.primary,
     borderColor: Colors.primary,
   },
-
   priorityButtonText: {
     color: Colors.secondary,
     fontSize: 10,
   },
-
   selectedPriorityText: {
     color: Colors.white,
   },
-
   formButtons: {
     flexDirection: "row",
     gap: 10,
     marginTop: 20,
   },
-
   cancelButton: {
     flex: 1,
     paddingVertical: 12,
@@ -1045,13 +1496,11 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     alignItems: "center",
   },
-
   cancelText: {
     color: Colors.secondary,
     fontSize: 10,
     fontWeight: "700",
   },
-
   saveButton: {
     flex: 1,
     paddingVertical: 12,
@@ -1059,20 +1508,17 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     alignItems: "center",
   },
-
   saveText: {
     color: Colors.white,
     fontSize: 10,
     fontWeight: "700",
   },
-
   activity: {
     flexDirection: "row",
     paddingVertical: 16,
     borderTopWidth: 1,
     borderTopColor: Colors.border,
   },
-
   checkbox: {
     width: 22,
     height: 22,
@@ -1083,78 +1529,64 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-
   checked: {
     backgroundColor: Colors.success,
     borderColor: Colors.success,
   },
-
   check: {
     color: Colors.white,
     fontWeight: "700",
   },
-
   inProgressCheckbox: {
     borderColor: Colors.accent,
   },
-
   activeDot: {
     width: 8,
     height: 8,
     borderRadius: 4,
     backgroundColor: Colors.accent,
   },
-
   activityContent: {
     flex: 1,
   },
-
   timeRow: {
     flexDirection: "row",
     justifyContent: "space-between",
   },
-
   time: {
     color: Colors.accent,
     fontSize: 10,
     fontWeight: "700",
   },
-
   priority: {
     color: Colors.secondary,
     fontSize: 8,
     textTransform: "uppercase",
   },
-
   highPriority: {
     color: Colors.accent,
     fontWeight: "700",
   },
-
   activityTitle: {
     color: Colors.primary,
     fontFamily: "Georgia",
     fontSize: 17,
     marginTop: 5,
   },
-
   completed: {
     textDecorationLine: "line-through",
     opacity: 0.5,
   },
-
   location: {
     color: Colors.secondary,
     fontSize: 11,
     marginTop: 5,
   },
-
   duration: {
     color: Colors.muted,
     fontSize: 10,
     marginTop: 4,
   },
-
   notes: {
     color: Colors.secondary,
     fontSize: 10,
@@ -1162,7 +1594,6 @@ const styles = StyleSheet.create({
     lineHeight: 16,
     marginTop: 8,
   },
-
   trackingDetails: {
     marginTop: 12,
     padding: 10,
@@ -1170,26 +1601,22 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     gap: 5,
   },
-
   trackingText: {
     color: Colors.secondary,
     fontSize: 10,
   },
-
   actualDuration: {
     color: Colors.primary,
     fontSize: 11,
     fontWeight: "700",
     marginTop: 3,
   },
-
   inProgressText: {
     color: Colors.accent,
     fontSize: 10,
     fontWeight: "700",
     marginTop: 3,
   },
-
   startButton: {
     marginTop: 14,
     paddingVertical: 11,
@@ -1199,14 +1626,12 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     alignSelf: "flex-start",
   },
-
   startButtonText: {
     color: Colors.primary,
     fontSize: 9,
     fontWeight: "700",
     letterSpacing: 1,
   },
-
   completeButton: {
     marginTop: 14,
     paddingVertical: 11,
@@ -1215,14 +1640,12 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     alignSelf: "flex-start",
   },
-
   completeButtonText: {
     color: Colors.white,
     fontSize: 9,
     fontWeight: "700",
     letterSpacing: 1,
   },
-
   completedBadge: {
     marginTop: 14,
     paddingVertical: 8,
@@ -1231,39 +1654,31 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     alignSelf: "flex-start",
   },
-
   completedBadgeText: {
     color: "#426B4B",
     fontSize: 9,
     fontWeight: "700",
     letterSpacing: 1,
   },
-
   emptyText: {
     color: Colors.secondary,
     fontSize: 12,
     lineHeight: 20,
     marginTop: 12,
   },
-
-  // Daily Return Deadline
-
   deadlineSection: {
     marginTop: 28,
     paddingTop: 23,
     borderTopWidth: 1,
     borderTopColor: Colors.border,
   },
-
   deadlineHeadingRow: {
     flexDirection: "row",
     alignItems: "flex-start",
   },
-
   deadlineHeadingContent: {
     flex: 1,
   },
-
   deadlineEyebrow: {
     color: Colors.accent,
     fontSize: 9,
@@ -1271,7 +1686,6 @@ const styles = StyleSheet.create({
     letterSpacing: 2,
     marginBottom: 9,
   },
-
   deadlineTitle: {
     color: Colors.primary,
     fontFamily: "Georgia",
@@ -1279,14 +1693,12 @@ const styles = StyleSheet.create({
     lineHeight: 30,
     fontWeight: "600",
   },
-
   deadlineDescription: {
     color: Colors.secondary,
     fontSize: 11,
     lineHeight: 17,
     marginTop: 7,
   },
-
   savedDeadlineCard: {
     flexDirection: "row",
     alignItems: "center",
@@ -1299,18 +1711,15 @@ const styles = StyleSheet.create({
     borderColor: "#E6E0D4",
     borderRadius: Radius.md,
   },
-
   savedDeadlineContent: {
     flex: 1,
   },
-
   savedDeadlineLabel: {
     color: Colors.accent,
     fontSize: 8,
     fontWeight: "700",
     letterSpacing: 1.5,
   },
-
   savedTimeRow: {
     flexDirection: "row",
     alignItems: "baseline",
@@ -1318,19 +1727,16 @@ const styles = StyleSheet.create({
     gap: 9,
     marginTop: 5,
   },
-
   savedDeadlineTime: {
     color: Colors.primary,
     fontFamily: "Georgia",
     fontSize: 25,
     fontWeight: "600",
   },
-
   savedDeadlineNote: {
     color: Colors.secondary,
     fontSize: 9,
   },
-
   editDeadlineButton: {
     width: 42,
     height: 42,
@@ -1340,13 +1746,11 @@ const styles = StyleSheet.create({
     borderRadius: 21,
     marginLeft: 12,
   },
-
   editDeadlineIcon: {
     color: Colors.primary,
     fontSize: 23,
     fontWeight: "600",
   },
-
   deadlineEditor: {
     marginTop: 15,
     padding: 12,
@@ -1355,41 +1759,34 @@ const styles = StyleSheet.create({
     borderColor: "#E6E0D4",
     borderRadius: Radius.md,
   },
-
   wheelRow: {
     flexDirection: "row",
     justifyContent: "center",
     alignItems: "center",
     gap: 8,
   },
-
   wheelContainer: {
     height: 108,
     overflow: "hidden",
     position: "relative",
   },
-
   wheelContent: {
     paddingVertical: 36,
   },
-
   wheelItem: {
     height: 36,
     alignItems: "center",
     justifyContent: "center",
   },
-
   wheelText: {
     color: Colors.muted,
     fontSize: 16,
   },
-
   selectedWheelText: {
     color: Colors.primary,
     fontSize: 19,
     fontWeight: "700",
   },
-
   wheelSelection: {
     position: "absolute",
     top: 36,
@@ -1400,13 +1797,11 @@ const styles = StyleSheet.create({
     borderRadius: Radius.sm,
     zIndex: 0,
   },
-
   timeSeparator: {
     color: Colors.primary,
     fontSize: 22,
     fontWeight: "600",
   },
-
   deadlineButtonRow: {
     flexDirection: "row",
     justifyContent: "flex-end",
@@ -1414,40 +1809,32 @@ const styles = StyleSheet.create({
     gap: 10,
     marginTop: 8,
   },
-
   cancelDeadlineButton: {
     paddingHorizontal: 14,
     paddingVertical: 11,
   },
-
   cancelDeadlineText: {
     color: Colors.secondary,
     fontSize: 10,
     fontWeight: "600",
   },
-
   saveDeadlineButton: {
     backgroundColor: Colors.primary,
     paddingHorizontal: 19,
     paddingVertical: 11,
     borderRadius: Radius.sm,
   },
-
   saveDeadlineText: {
     color: Colors.white,
     fontSize: 10,
     fontWeight: "700",
     letterSpacing: 0.3,
   },
-
-  // Replan Button
-
   replanWrapper: {
     position: "relative",
     alignItems: "center",
     zIndex: 10,
   },
-
   replanButton: {
     width: 46,
     height: 46,
@@ -1457,11 +1844,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     elevation: 5,
   },
-
   replanButtonDisabled: {
     opacity: 0.6,
   },
-
   replanTooltip: {
     position: "absolute",
     top: 54,
@@ -1475,15 +1860,292 @@ const styles = StyleSheet.create({
     zIndex: 20,
     elevation: 6,
   },
-
   replanTooltipText: {
     color: Colors.white,
     fontSize: 11,
     fontWeight: "600",
   },
-
   error: {
     color: Colors.primary,
     padding: 25,
+  },
+
+  // Accommodation
+  accommodationCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginTop: 20,
+    padding: 13,
+    backgroundColor: "#F1EEE6",
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    borderColor: "#E6E0D4",
+  },
+  accommodationIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: "#E5DFD2",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 11,
+  },
+  accommodationContent: {
+    flex: 1,
+  },
+  accommodationLabel: {
+    color: Colors.accent,
+    fontSize: 8,
+    fontWeight: "700",
+    letterSpacing: 1.3,
+  },
+  accommodationValue: {
+    color: Colors.primary,
+    fontSize: 11,
+    fontWeight: "600",
+    marginTop: 5,
+  },
+  accommodationEditButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#E5DFD2",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 8,
+  },
+
+  // Modals
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(15, 25, 40, 0.55)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 18,
+  },
+  modalCard: {
+    width: "100%",
+    maxWidth: 500,
+    backgroundColor: "#FFFDF8",
+    borderRadius: Radius.md,
+    padding: 22,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  modalEyebrow: {
+    color: Colors.accent,
+    fontSize: 9,
+    fontWeight: "700",
+    letterSpacing: 2,
+  },
+  modalTitle: {
+    color: Colors.primary,
+    fontFamily: "Georgia",
+    fontSize: 25,
+    marginTop: 9,
+  },
+  modalDescription: {
+    color: Colors.secondary,
+    fontSize: 11,
+    lineHeight: 18,
+    marginTop: 9,
+    marginBottom: 17,
+  },
+  modalButtons: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 18,
+  },
+  previewCard: {
+    width: "100%",
+    maxWidth: 560,
+    maxHeight: "90%",
+    backgroundColor: "#FFFDF8",
+    borderRadius: Radius.md,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: Colors.border,
+  },
+  previewHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    marginBottom: 16,
+  },
+  previewHeaderContent: {
+    flex: 1,
+  },
+  previewTitle: {
+    color: Colors.primary,
+    fontFamily: "Georgia",
+    fontSize: 27,
+    marginTop: 6,
+  },
+  previewSubtitle: {
+    color: Colors.secondary,
+    fontSize: 11,
+    marginTop: 5,
+  },
+  closeButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: "#F1EEE6",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 10,
+  },
+  previewScroll: {
+    flexGrow: 0,
+  },
+  resultSummary: {
+    backgroundColor: "#F1EEE6",
+    borderRadius: Radius.sm,
+    padding: 13,
+    marginBottom: 17,
+  },
+  resultSummaryTitle: {
+    color: Colors.primary,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  resultSummaryText: {
+    color: Colors.secondary,
+    fontSize: 11,
+    lineHeight: 18,
+    marginTop: 6,
+  },
+  previewSectionTitle: {
+    color: Colors.accent,
+    fontSize: 9,
+    fontWeight: "700",
+    letterSpacing: 1.5,
+    marginTop: 15,
+    marginBottom: 9,
+  },
+  previewItem: {
+    paddingVertical: 11,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  previewItemTitle: {
+    color: Colors.primary,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  changeTimeRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 8,
+  },
+  oldTime: {
+    color: Colors.muted,
+    fontSize: 12,
+    textDecorationLine: "line-through",
+  },
+  newTime: {
+    color: Colors.success,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  previewReason: {
+    color: Colors.secondary,
+    fontSize: 10,
+    lineHeight: 16,
+    marginTop: 5,
+    flexShrink: 1,
+  },
+  previewEmpty: {
+    color: Colors.secondary,
+    fontSize: 11,
+    lineHeight: 18,
+    marginTop: 5,
+  },
+  warningItem: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 8,
+    paddingVertical: 9,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.border,
+  },
+  alternativeGroup: {
+    marginBottom: 12,
+  },
+  alternativeItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 11,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: Radius.sm,
+    backgroundColor: Colors.surface,
+  },
+  selectedAlternativeItem: {
+    borderColor: Colors.success,
+    backgroundColor: "#EDF3EA",
+  },
+  alternativeText: {
+    flex: 1,
+    paddingRight: 10,
+  },
+  alternativeName: {
+    color: Colors.primary,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  alternativeTravel: {
+    color: Colors.accent,
+    fontSize: 10,
+    fontWeight: "700",
+    marginTop: 5,
+  },
+  delayText: {
+    color: Colors.accent,
+    fontSize: 11,
+    fontWeight: "700",
+    marginTop: 15,
+  },
+  previewFootnote: {
+    color: Colors.secondary,
+    fontSize: 10,
+    lineHeight: 16,
+    fontStyle: "italic",
+    marginTop: 17,
+    marginBottom: 12,
+  },
+  previewActions: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 15,
+    paddingTop: 13,
+    borderTopWidth: 1,
+    borderTopColor: Colors.border,
+  },
+  previewDiscardButton: {
+    flex: 1,
+    paddingVertical: 13,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: Colors.border,
+    borderRadius: Radius.sm,
+  },
+  previewDiscardText: {
+    color: Colors.secondary,
+    fontSize: 11,
+    fontWeight: "700",
+  },
+  previewAcceptButton: {
+    flex: 1.4,
+    paddingVertical: 13,
+    alignItems: "center",
+    backgroundColor: Colors.primary,
+    borderRadius: Radius.sm,
+  },
+  previewAcceptText: {
+    color: Colors.white,
+    fontSize: 11,
+    fontWeight: "700",
   },
 });

@@ -1,4 +1,3 @@
-
 import {
     calculateCurrentActivityOverrun,
     calculateTotalDelay,
@@ -7,6 +6,8 @@ import {
 
 import {
     ActivityScheduleChange,
+    AlternativePlace,
+    AlternativeSuggestion,
     OpeningWindow,
     ReplanningActivity,
     ReplanningInput,
@@ -19,7 +20,6 @@ const MINUTES_IN_DAY = 24 * 60;
 function parseTime(time: string): number | null {
   const value = time.trim().toUpperCase();
 
-  // Supports 12-hour format: 9:30 AM
   const twelveHour = value.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/);
 
   if (twelveHour) {
@@ -37,7 +37,6 @@ function parseTime(time: string): number | null {
     return hours * 60 + minutes;
   }
 
-  // Supports 24-hour format: 14:30
   const twentyFourHour = value.match(/^(\d{1,2}):(\d{2})$/);
 
   if (twentyFourHour) {
@@ -55,7 +54,8 @@ function parseTime(time: string): number | null {
 }
 
 function formatTime(totalMinutes: number): string {
-  const normalized = totalMinutes % MINUTES_IN_DAY;
+  const normalized =
+    ((totalMinutes % MINUTES_IN_DAY) + MINUTES_IN_DAY) % MINUTES_IN_DAY;
 
   const hours = Math.floor(normalized / 60);
   const minutes = normalized % 60;
@@ -66,17 +66,23 @@ function formatTime(totalMinutes: number): string {
   return `${displayHours}:${String(minutes).padStart(2, "0")} ${period}`;
 }
 
+function normalizeLocation(location: string): string {
+  return location.trim().toLowerCase();
+}
+
 function getTravelTime(
   from: string,
   to: string,
   travelTimes: ReplanningInput["travelTimes"],
 ): number | null {
-  if (from.trim().toLowerCase() === to.trim().toLowerCase()) {
+  if (normalizeLocation(from) === normalizeLocation(to)) {
     return 0;
   }
 
   const route = travelTimes.find(
-    (item) => item.from === from && item.to === to,
+    (item) =>
+      normalizeLocation(item.from) === normalizeLocation(from) &&
+      normalizeLocation(item.to) === normalizeLocation(to),
   );
 
   return route ? Math.max(0, route.durationMinutes) : null;
@@ -95,8 +101,6 @@ function fitsOpeningHours(
   duration: number,
   openingHours?: OpeningWindow[],
 ): number | null {
-  // Missing opening hours means availability is unknown.
-  // Do not assume the place is closed.
   if (!openingHours || openingHours.length === 0) {
     return start;
   }
@@ -109,7 +113,6 @@ function fitsOpeningHours(
       continue;
     }
 
-    // Support opening windows that cross midnight.
     if (closesAt <= opensAt) {
       closesAt += MINUTES_IN_DAY;
     }
@@ -136,9 +139,133 @@ function addUnscheduled(
   };
 }
 
+function getActiveActivity(
+  activities: ReplanningActivity[],
+): ReplanningActivity | undefined {
+  return activities.find(
+    (activity) =>
+      !!activity.actualStartAt && !activity.actualEndAt && !activity.completed,
+  );
+}
+
+function getLatestCompletedActivity(
+  activities: ReplanningActivity[],
+): ReplanningActivity | undefined {
+  return [...activities]
+    .filter((activity) => !!activity.actualEndAt)
+    .sort(
+      (first, second) =>
+        new Date(second.actualEndAt!).getTime() -
+        new Date(first.actualEndAt!).getTime(),
+    )[0];
+}
+
+function getPlannedTime(activity: ReplanningActivity): number {
+  return parseTime(activity.time) ?? MINUTES_IN_DAY;
+}
+
+/**
+ * Finds nearby places that can replace an activity
+ * without violating the next protected event or return deadline.
+ */
+function findFittingAlternatives(
+  activity: ReplanningActivity,
+  duration: number,
+  cursor: number,
+  currentLocation: string,
+  nextDestination: string,
+  availableUntil: number,
+  alternatives: AlternativePlace[],
+): AlternativeSuggestion | null {
+  const fittingAlternatives: AlternativePlace[] = [];
+
+  const plannedStart = parseTime(activity.time);
+
+  if (plannedStart === null) {
+    return null;
+  }
+
+  for (const alternative of alternatives) {
+    const travelFromCurrent = alternative.travelTimeMinutes;
+
+    if (!Number.isFinite(travelFromCurrent) || travelFromCurrent < 0) {
+      continue;
+    }
+
+    // Calculate when the user can reach the alternative.
+    const arrivalTime = cursor + travelFromCurrent;
+
+    const possibleStart = Math.max(arrivalTime, plannedStart);
+
+    // Check the alternative's opening hours, if available.
+    const alternativeStart = fitsOpeningHours(
+      possibleStart,
+      duration,
+      alternative.openingHours,
+    );
+
+    if (alternativeStart === null) {
+      continue;
+    }
+
+    // Find the onward road travel time.
+    const onwardTravelTime =
+      alternative.travelTimesToDestinations?.[nextDestination];
+
+    if (
+      onwardTravelTime === undefined ||
+      !Number.isFinite(onwardTravelTime) ||
+      onwardTravelTime < 0
+    ) {
+      continue;
+    }
+
+    // Check whether the alternative and onward journey fit.
+    const finishTime = alternativeStart + duration;
+    const finalArrival = finishTime + onwardTravelTime;
+
+    if (finalArrival > availableUntil) {
+      continue;
+    }
+
+    fittingAlternatives.push({
+      ...alternative,
+      reason:
+        `${alternative.travelTimeMinutes} minutes from your current location, ` +
+        `${duration} minutes for the activity, and ` +
+        `${onwardTravelTime} minutes to ${nextDestination}.`,
+    });
+  }
+
+  if (fittingAlternatives.length === 0) {
+    return null;
+  }
+
+  // Prefer alternatives with shorter total journey times.
+  fittingAlternatives.sort((first, second) => {
+    const firstOnward = first.travelTimesToDestinations?.[nextDestination] ?? 0;
+
+    const secondOnward =
+      second.travelTimesToDestinations?.[nextDestination] ?? 0;
+
+    return (
+      first.travelTimeMinutes +
+      firstOnward -
+      (second.travelTimeMinutes + secondOnward)
+    );
+  });
+
+  return {
+    activityId: activity.id,
+    originalTitle: activity.title,
+    alternatives: fittingAlternatives.slice(0, 5),
+  };
+}
+
 export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
   const changes: ActivityScheduleChange[] = [];
   const unscheduledActivities: UnscheduledActivity[] = [];
+  const alternativeSuggestions: AlternativeSuggestion[] = [];
   const warnings: string[] = [];
 
   const currentTime = parseTime(input.currentTime);
@@ -150,7 +277,7 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
       isFeasible: false,
       changes,
       unscheduledActivities,
-      alternativeSuggestions: [],
+      alternativeSuggestions,
       totalDelayMinutes: 0,
       warnings: ["Invalid current time or return deadline."],
       explanation:
@@ -160,47 +287,35 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
 
   let isFeasible = true;
 
-  // Calculate delays from completed activities.
+  // Calculate delays from completed and ongoing activities.
   const totalDelayMinutes = input.activities.reduce((total, activity) => {
     const overrun = calculateCurrentActivityOverrun(activity);
 
     return total + (overrun?.overrunMinutes ?? 0);
   }, calculateTotalDelay(input.activities));
 
-  // Find the activity currently in progress, if any.
-  const activeActivity = input.activities.find(
-    (activity) =>
-      activity.actualStartAt && !activity.actualEndAt && !activity.completed,
-  );
+  // Identify the currently running activity.
+  const activeActivity = getActiveActivity(input.activities);
 
-  // Determine the user's current location.
-  const latestCompleted = [...input.activities]
-    .filter((activity) => activity.actualEndAt)
-    .sort(
-      (a, b) =>
-        new Date(b.actualEndAt!).getTime() - new Date(a.actualEndAt!).getTime(),
-    )[0];
+  // Identify the most recently completed activity.
+  const latestCompleted = getLatestCompletedActivity(input.activities);
 
+  // Start from the actual GPS or active-activity location.
   let currentLocation =
+    input.startingLocationId ||
     activeActivity?.location ||
     latestCompleted?.location ||
     input.returnLocation;
 
-  // The active activity is still running, so future activities
-  // cannot begin before the current time.
+  // Future activities cannot begin before the current time.
   let cursor = currentTime;
 
-  // Completed and currently running activities are not rescheduled.
+  // Completed and ongoing activities are never rescheduled.
   const remainingActivities = input.activities
     .filter(
       (activity) => !activity.completed && activity.id !== activeActivity?.id,
     )
-    .sort((a, b) => {
-      const aTime = parseTime(a.time) ?? MINUTES_IN_DAY;
-      const bTime = parseTime(b.time) ?? MINUTES_IN_DAY;
-
-      return aTime - bTime;
-    });
+    .sort((first, second) => getPlannedTime(first) - getPlannedTime(second));
 
   for (let i = 0; i < remainingActivities.length; i++) {
     const activity = remainingActivities[i];
@@ -208,6 +323,7 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
     const plannedStart = parseTime(activity.time);
     const duration = parseDurationToMinutes(activity.duration);
 
+    // Validate the activity's scheduled time and duration.
     if (plannedStart === null || duration <= 0) {
       const reason = "The activity has an invalid scheduled time or duration.";
 
@@ -221,6 +337,35 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
       continue;
     }
 
+    // Find the next protected activity.
+    const nextProtected = remainingActivities.slice(i + 1).find(isProtected);
+
+    const nextDestination = nextProtected?.location ?? input.returnLocation;
+
+    const availableUntil = nextProtected
+      ? parseTime(nextProtected.time)
+      : returnDeadline;
+
+    // Validate the next destination's scheduled time.
+    if (availableUntil === null) {
+      if (isProtected(activity)) {
+        isFeasible = false;
+        warnings.push(
+          `${activity.title}: The next protected activity has an invalid scheduled time.`,
+        );
+      } else {
+        unscheduledActivities.push(
+          addUnscheduled(
+            activity,
+            "The next destination has an invalid scheduled time.",
+          ),
+        );
+      }
+
+      continue;
+    }
+
+    // Find the road travel time to this activity.
     const travelToActivity = getTravelTime(
       currentLocation,
       activity.location,
@@ -235,16 +380,30 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
         warnings.push(`${activity.title}: ${reason}`);
       } else {
         unscheduledActivities.push(addUnscheduled(activity, reason));
+
+        const suggestion = findFittingAlternatives(
+          activity,
+          duration,
+          cursor,
+          currentLocation,
+          nextDestination,
+          availableUntil,
+          input.nearbyAlternatives ?? [],
+        );
+
+        if (suggestion) {
+          alternativeSuggestions.push(suggestion);
+        }
       }
 
       continue;
     }
 
-    // Protected activities keep their original scheduled time.
-    if (isProtected(activity)) {
-      const arrivalTime = cursor + travelToActivity;
+    const arrivalTime = cursor + travelToActivity;
 
-      if (plannedStart < currentTime || arrivalTime > plannedStart) {
+    // High-priority and fixed activities retain their original times.
+    if (isProtected(activity)) {
+      if (arrivalTime > plannedStart || cursor > plannedStart) {
         isFeasible = false;
 
         warnings.push(
@@ -252,39 +411,49 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
         );
       }
 
-      cursor = Math.max(cursor, plannedStart + duration);
+      cursor = Math.max(arrivalTime, plannedStart) + duration;
       currentLocation = activity.location;
 
       continue;
     }
 
-    // Flexible activities can be moved, but never earlier
-    // than their original scheduled time.
-    let proposedStart = Math.max(
-      cursor + travelToActivity,
-      plannedStart,
-      currentTime,
+    // Flexible activities may move later, but never earlier
+    // than their originally planned time.
+    let proposedStart = Math.max(arrivalTime, plannedStart, currentTime);
+
+    const openingTime = fitsOpeningHours(
+      proposedStart,
+      duration,
+      activity.openingHours,
     );
 
-    proposedStart =
-      fitsOpeningHours(proposedStart, duration, activity.openingHours) ?? -1;
+    if (openingTime === null) {
+      const reason =
+        "The activity cannot fit within the available opening hours.";
 
-    if (proposedStart < 0) {
-      unscheduledActivities.push(
-        addUnscheduled(
-          activity,
-          "The activity cannot fit within the available opening hours.",
-        ),
+      unscheduledActivities.push(addUnscheduled(activity, reason));
+
+      const suggestion = findFittingAlternatives(
+        activity,
+        duration,
+        cursor,
+        currentLocation,
+        nextDestination,
+        availableUntil,
+        input.nearbyAlternatives ?? [],
       );
+
+      if (suggestion) {
+        alternativeSuggestions.push(suggestion);
+      }
 
       continue;
     }
 
-    // Check the next protected activity, if one exists.
-    const nextProtected = remainingActivities.slice(i + 1).find(isProtected);
+    proposedStart = openingTime;
 
-    const nextDestination = nextProtected?.location ?? input.returnLocation;
-
+    // Find the travel time to the next protected activity
+    // or the accommodation.
     const travelAfterActivity = getTravelTime(
       activity.location,
       nextDestination,
@@ -292,12 +461,23 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
     );
 
     if (travelAfterActivity === null) {
-      unscheduledActivities.push(
-        addUnscheduled(
-          activity,
-          `Travel time from ${activity.location} to ${nextDestination} is unavailable.`,
-        ),
+      const reason = `Travel time from ${activity.location} to ${nextDestination} is unavailable.`;
+
+      unscheduledActivities.push(addUnscheduled(activity, reason));
+
+      const suggestion = findFittingAlternatives(
+        activity,
+        duration,
+        cursor,
+        currentLocation,
+        nextDestination,
+        availableUntil,
+        input.nearbyAlternatives ?? [],
       );
+
+      if (suggestion) {
+        alternativeSuggestions.push(suggestion);
+      }
 
       continue;
     }
@@ -305,30 +485,37 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
     const finishTime = proposedStart + duration;
     const arrivalAfterActivity = finishTime + travelAfterActivity;
 
-    const availableUntil = nextProtected
-      ? parseTime(nextProtected.time)
-      : returnDeadline;
+    if (arrivalAfterActivity > availableUntil) {
+      const reason = nextProtected
+        ? "There is not enough time before the next protected activity."
+        : "The activity would make it impossible to return before the daily deadline.";
 
-    if (availableUntil === null || arrivalAfterActivity > availableUntil) {
-      unscheduledActivities.push(
-        addUnscheduled(
-          activity,
-          nextProtected
-            ? "There is not enough time before the next protected activity."
-            : "The activity would make it impossible to return before the daily deadline.",
-        ),
+      unscheduledActivities.push(addUnscheduled(activity, reason));
+
+      const suggestion = findFittingAlternatives(
+        activity,
+        duration,
+        cursor,
+        currentLocation,
+        nextDestination,
+        availableUntil,
+        input.nearbyAlternatives ?? [],
       );
+
+      if (suggestion) {
+        alternativeSuggestions.push(suggestion);
+      }
 
       continue;
     }
 
-    // Record a proposed change only if the time actually changed.
+    // Record a proposed change only when the scheduled time differs.
     if (proposedStart !== plannedStart) {
       changes.push({
         activityId: activity.id,
         originalTime: activity.time,
         proposedTime: formatTime(proposedStart),
-        reason: "Adjusted to account for delays and travel time.",
+        reason: "Adjusted to account for current delays and road travel time.",
       });
     }
 
@@ -336,38 +523,36 @@ export function optimizeItinerary(input: ReplanningInput): ReplanningResult {
     currentLocation = activity.location;
   }
 
-  // Check whether the final location can reach the accommodation
-  // before the daily return deadline.
-  if (remainingActivities.length > 0) {
-    const travelToReturn = getTravelTime(
-      currentLocation,
-      input.returnLocation,
-      input.travelTimes,
+  // Verify that the user can return to their accommodation
+  // before the daily deadline.
+  const travelToReturn = getTravelTime(
+    currentLocation,
+    input.returnLocation,
+    input.travelTimes,
+  );
+
+  if (travelToReturn === null) {
+    isFeasible = false;
+
+    warnings.push("Travel time back to the accommodation is unavailable.");
+  } else if (cursor + travelToReturn > returnDeadline) {
+    isFeasible = false;
+
+    warnings.push(
+      "The remaining itinerary cannot meet the daily return deadline.",
     );
-
-    if (travelToReturn === null) {
-      isFeasible = false;
-
-      warnings.push("Travel time back to the accommodation is unavailable.");
-    } else if (cursor + travelToReturn > returnDeadline) {
-      isFeasible = false;
-
-      warnings.push(
-        "The remaining protected schedule cannot meet the daily return deadline.",
-      );
-    }
   }
 
   const explanation = isFeasible
-    ? "The revised schedule preserves all protected activities and respects the available time and travel constraints. Review the proposed changes before approving."
-    : "The itinerary has one or more conflicts involving protected activities or the return deadline. Review the warnings before approving.";
+    ? "The revised schedule preserves completed, ongoing, High-priority and fixed activities while respecting available time and travel constraints. Review the proposed changes and alternatives before approving."
+    : "The itinerary has one or more conflicts involving protected activities, unavailable routes or the return deadline. Review the warnings before approving.";
 
   return {
     success: true,
     isFeasible,
     changes,
     unscheduledActivities,
-    alternativeSuggestions: [],
+    alternativeSuggestions,
     totalDelayMinutes,
     warnings,
     explanation,

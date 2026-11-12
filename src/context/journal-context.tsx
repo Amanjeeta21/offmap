@@ -1,4 +1,3 @@
-
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   createContext,
@@ -45,6 +44,7 @@ export type TravelJournal = {
   coverImage: string;
   isSample: boolean;
   createdAt: string;
+  accommodationLocation?: string;
   days: JournalDay[];
 };
 
@@ -64,6 +64,10 @@ type JournalContextType = {
   updateJournal: (
     id: string,
     changes: Partial<Omit<TravelJournal, "id" | "createdAt">>,
+  ) => void;
+  updateAccommodationLocation: (
+    journalId: string,
+    accommodationLocation: string,
   ) => void;
   deleteJournal: (id: string) => void;
   getJournal: (id: string) => TravelJournal | undefined;
@@ -103,6 +107,7 @@ const SAMPLE_JOURNAL: TravelJournal = {
     "https://images.unsplash.com/photo-1561361513-2d000a50f0dc?w=1200",
   isSample: true,
   createdAt: "2026-11-09T00:00:00.000Z",
+  accommodationLocation: "",
   days: [
     {
       id: "varanasi-day-1",
@@ -278,7 +283,6 @@ const SAMPLE_JOURNAL: TravelJournal = {
   ],
 };
 
-// Generate one empty itinerary day for every date in the trip.
 function createJournalDays(startDate: string, endDate: string): JournalDay[] {
   const [startYear, startMonth, startDay] = startDate.split("-").map(Number);
   const [endYear, endMonth, endDay] = endDate.split("-").map(Number);
@@ -313,15 +317,17 @@ function createJournalDays(startDate: string, endDate: string): JournalDay[] {
   return days;
 }
 
-// Repair older saved journals without breaking existing data.
+// Migrate older saved journals without losing existing information.
 function migrateJournal(journal: TravelJournal): TravelJournal {
   return {
     ...journal,
+    accommodationLocation: journal.accommodationLocation ?? "",
     days:
       Array.isArray(journal.days) && journal.days.length > 0
         ? journal.days.map((day) => ({
             ...day,
             returnDeadline: day.returnDeadline ?? undefined,
+            activities: Array.isArray(day.activities) ? day.activities : [],
           }))
         : createJournalDays(journal.startDate, journal.endDate),
   };
@@ -337,7 +343,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
   const [journals, setJournals] = useState<TravelJournal[]>([SAMPLE_JOURNAL]);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load and migrate saved journals when the app starts.
   useEffect(() => {
     async function loadJournals() {
       try {
@@ -370,7 +375,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
     loadJournals();
   }, []);
 
-  // Save journal changes after initial loading.
   useEffect(() => {
     if (isLoading) return;
 
@@ -385,13 +389,13 @@ export function JournalProvider({ children }: JournalProviderProps) {
     saveJournals();
   }, [journals, isLoading]);
 
-  // Create a journal with automatically generated itinerary days.
   function addJournal(journal: NewJournal) {
     const newJournal: TravelJournal = {
       ...journal,
       id: `journal-${Date.now()}`,
       isSample: false,
       createdAt: new Date().toISOString(),
+      accommodationLocation: "",
       days: createJournalDays(journal.startDate, journal.endDate),
     };
 
@@ -409,6 +413,15 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
+  function updateAccommodationLocation(
+    journalId: string,
+    accommodationLocation: string,
+  ) {
+    updateJournal(journalId, {
+      accommodationLocation: accommodationLocation.trim(),
+    });
+  }
+
   function deleteJournal(id: string) {
     setJournals((current) => current.filter((journal) => journal.id !== id));
   }
@@ -417,7 +430,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
     return journals.find((journal) => journal.id === id);
   }
 
-  // Update an existing activity.
   function updateActivity(
     journalId: string,
     dayId: string,
@@ -447,23 +459,18 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
-  // Start an activity if no other activity is currently in progress.
   function startActivity(
     journalId: string,
     dayId: string,
     activityId: string,
   ): boolean {
     const journal = journals.find((item) => item.id === journalId);
-
     if (!journal) return false;
 
     const day = journal.days.find((item) => item.id === dayId);
-
     if (!day) return false;
 
-    const activity = day.activities.find(
-      (item) => item.id === activityId,
-    );
+    const activity = day.activities.find((item) => item.id === activityId);
 
     if (!activity || activity.completed || activity.actualStartAt) {
       return false;
@@ -482,7 +489,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
     return true;
   }
 
-  // Add a new activity to a particular day.
   function addActivity(
     journalId: string,
     dayId: string,
@@ -513,7 +519,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
-  // Update notes for a particular day.
   function updateDayNotes(journalId: string, dayId: string, notes: string) {
     setJournals((current) =>
       current.map((journal) => {
@@ -529,8 +534,6 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
-  // Update the return deadline for an individual day.
-  // Store time in 24-hour HH:mm format.
   function updateDayDeadline(
     journalId: string,
     dayId: string,
@@ -543,9 +546,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
         return {
           ...journal,
           days: journal.days.map((day) =>
-            day.id === dayId
-              ? { ...day, returnDeadline }
-              : day,
+            day.id === dayId ? { ...day, returnDeadline } : day,
           ),
         };
       }),
@@ -558,6 +559,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
       isLoading,
       addJournal,
       updateJournal,
+      updateAccommodationLocation,
       deleteJournal,
       getJournal,
       updateActivity,
@@ -570,9 +572,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
   );
 
   return (
-    <JournalContext.Provider value={value}>
-      {children}
-    </JournalContext.Provider>
+    <JournalContext.Provider value={value}>{children}</JournalContext.Provider>
   );
 }
 
