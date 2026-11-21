@@ -1,114 +1,165 @@
-import { UserCoordinates } from "@/services/location-service";
+import type { UserCoordinates } from "@/services/location-service";
+import { reverseGeocodeLocation } from "@/services/geocoding-service";
 
-export type NearbyPlace = {
+export type NearbyPlace = UserCoordinates & {
   id: number;
+  osmType?: string;
   name: string;
   category: string;
-  latitude: number;
-  longitude: number;
   distance: number;
   address?: string;
 };
 
-const OVERPASS_URL = process.env.EXPO_PUBLIC_OVERPASS_API_URL;
+type OverpassElement = {
+  id: number;
+  type: string;
+  lat?: number;
+  lon?: number;
+  center?: { lat: number; lon: number };
+  tags?: Record<string, string>;
+};
 
-function calculateDistance(
-  origin: UserCoordinates,
-  destination: UserCoordinates,
-): number {
-  const earthRadius = 6371000;
+const OVERPASS_URL =
+  process.env.EXPO_PUBLIC_OVERPASS_API_URL ||
+  "https://overpass-api.de/api/interpreter";
 
-  const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
+function calculateDistance(origin: UserCoordinates, destination: UserCoordinates): number {
+  const radians = Math.PI / 180;
+  const deltaLat = (destination.latitude - origin.latitude) * radians;
+  const deltaLon = (destination.longitude - origin.longitude) * radians;
+  const a = Math.sin(deltaLat / 2) ** 2 +
+    Math.cos(origin.latitude * radians) * Math.cos(destination.latitude * radians) *
+    Math.sin(deltaLon / 2) ** 2;
 
-  const lat1 = toRadians(origin.latitude);
-  const lat2 = toRadians(destination.latitude);
-  const deltaLat = toRadians(destination.latitude - origin.latitude);
-  const deltaLon = toRadians(destination.longitude - origin.longitude);
-
-  const a =
-    Math.sin(deltaLat / 2) ** 2 +
-    Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLon / 2) ** 2;
-
-  return Math.round(
-    earthRadius * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)),
-  );
+  return Math.round(12742000 * Math.asin(Math.sqrt(Math.min(1, a))));
 }
+
+const landmarkFilters = [
+  '["amenity"~"^(place_of_worship|marketplace|restaurant|cafe|fast_food|bar|pub|theatre|library|townhall|community_centre)$"]',
+  '["tourism"~"^(attraction|museum|gallery|viewpoint|zoo|theme_park|artwork|hotel|information)$"]',
+  '["historic"]',
+  '["leisure"~"^(park|garden|nature_reserve)$"]',
+  '["man_made"~"^(ghat|pier|tower|lighthouse|water_well)$"]',
+  '["waterway"="ghat"]',
+  '["highway"="steps"]["name"~"ghat",i]',
+  '["building"~"^(temple|church|mosque|cathedral|synagogue|shrine|palace|train_station|civic)$"]',
+  '["shop"~"^(mall|department_store|supermarket)$"]',
+];
 
 export async function getNearbyPlaces(
   coordinates: UserCoordinates,
   radius = 5000,
 ): Promise<NearbyPlace[]> {
-  if (!OVERPASS_URL) {
-    throw new Error("Overpass API URL is missing from the environment.");
-  }
-
   const { latitude, longitude } = coordinates;
+  const query = `[out:json][timeout:10];(
+    ${landmarkFilters.map((filter) =>
+      `nwr(around:${radius},${latitude},${longitude})["name"]${filter};`,
+    ).join("\n")}
+  );out center;`;
 
-  const query = `
-    [out:json][timeout:25];
-
-    (
-      nwr(around:${radius},${latitude},${longitude})["amenity"~"restaurant|cafe|fast_food|bar|pub|place_of_worship"];
-      nwr(around:${radius},${latitude},${longitude})["tourism"~"attraction|museum|gallery|viewpoint|zoo|theme_park"];
-      nwr(around:${radius},${latitude},${longitude})["historic"~"monument|memorial|castle|archaeological_site"];
-      nwr(around:${radius},${latitude},${longitude})["leisure"~"park|garden|nature_reserve"];
-    );
-
-    out center tags;
-  `;
-
-  const response = await fetch(OVERPASS_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: `data=${encodeURIComponent(query)}`,
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Nearby places request failed with status ${response.status}.`,
-    );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 14000);
+  let data: { elements?: OverpassElement[]; remark?: string };
+  try {
+    const response = await fetch(OVERPASS_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: `data=${encodeURIComponent(query)}`,
+      signal: controller.signal,
+    }).catch(() => {
+      throw new Error("Couldn't reach the nearby places service. Check your connection and try again.");
+    });
+    if (!response.ok) {
+      throw new Error(`The nearby places service returned HTTP ${response.status}. Try again shortly.`);
+    }
+    data = await response.json().catch(() => {
+      throw new Error("The nearby places service returned an unreadable response. Try again shortly.");
+    });
+  } finally {
+    clearTimeout(timer);
   }
 
-  const data = await response.json();
+  if (!Array.isArray(data.elements) || data.remark) {
+    throw new Error("The nearby places service could not finish the search. Try again shortly.");
+  }
 
-  const places: NearbyPlace[] = data.elements
-    .map((element: any) => {
-      const lat = element.lat ?? element.center?.lat;
-      const lon = element.lon ?? element.center?.lon;
+  const places = data.elements.flatMap((element): NearbyPlace[] => {
+    const lat = element.lat ?? element.center?.lat;
+    const lon = element.lon ?? element.center?.lon;
+    const tags = element.tags;
+    const name = tags?.name?.trim();
+    if (!tags || !name || lat == null || lon == null ||
+        !Number.isFinite(lat) || !Number.isFinite(lon) ||
+        Math.abs(lat) > 90 || Math.abs(lon) > 180) return [];
 
-      if (lat == null || lon == null || !element.tags?.name) {
-        return null;
-      }
+    const category =
+      tags.waterway === "ghat" || tags.man_made === "ghat" || /\bghat\b/i.test(name)
+        ? "ghat"
+        : tags.amenity === "place_of_worship" && tags.building && tags.building !== "yes"
+          ? tags.building
+          : tags.amenity ?? tags.tourism ?? tags.historic ?? tags.leisure ??
+            tags.man_made ?? tags.building ?? tags.shop ?? "landmark";
+    const position = { latitude: lat, longitude: lon };
 
-      const tags = element.tags;
+    return [{
+      id: element.id,
+      osmType: element.type,
+      name,
+      category: category.replace(/_/g, " "),
+      ...position,
+      distance: calculateDistance(coordinates, position),
+      address: [tags["addr:street"], tags["addr:city"]].filter(Boolean).join(", ") || undefined,
+    }];
+  }).sort((first, second) => first.distance - second.distance);
 
-      return {
-        id: element.id,
-        name: tags.name,
-        category:
-          tags.amenity ??
-          tags.tourism ??
-          tags.historic ??
-          tags.leisure ??
-          "place",
-        latitude: lat,
-        longitude: lon,
-        distance: calculateDistance(coordinates, {
-          latitude: lat,
-          longitude: lon,
-        }),
-        address:
-          [tags["addr:street"], tags["addr:city"]].filter(Boolean).join(", ") ||
-          undefined,
-      };
-    })
-    .filter((place: NearbyPlace | null): place is NearbyPlace => place !== null)
-    .sort(
-      (first: NearbyPlace, second: NearbyPlace) =>
-        first.distance - second.distance,
+  return deduplicatePlaces(places);
+}
+
+function deduplicatePlaces(places: NearbyPlace[]) {
+  const unique: NearbyPlace[] = [];
+  for (const place of places) {
+    const duplicate = unique.some((other) =>
+      (other.osmType === place.osmType && other.id === place.id) ||
+      (other.name.normalize("NFKC").toLowerCase() === place.name.normalize("NFKC").toLowerCase() &&
+        calculateDistance(other, place) <= 35),
     );
+    if (!duplicate) unique.push(place);
+  }
+  return unique;
+}
 
-  return places;
+export async function findNearbyLandmarks(coordinates: UserCoordinates) {
+  const found = new Map<string, NearbyPlace>();
+  let searchError: string | undefined;
+
+  for (const radius of [50, 100, 200]) {
+    try {
+      const places = await getNearbyPlaces(coordinates, radius);
+      for (const place of places) {
+        found.set(`${place.osmType}/${place.id}`, place);
+      }
+      if (found.size >= 3) break;
+    } catch (error) {
+      searchError = error instanceof Error ? error.message : "Nearby places are temporarily unavailable.";
+      break;
+    }
+  }
+
+  const places = deduplicatePlaces(
+    [...found.values()].sort((first, second) => first.distance - second.distance),
+  );
+  if (places.length) return { places, message: searchError, hasMapData: true };
+
+  const area = await reverseGeocodeLocation(coordinates).catch(() => null);
+  const message = searchError ?? "No named landmarks were found within 200 m.";
+  return {
+    places,
+    hasMapData: Boolean(area),
+    message: area
+      ? `${message} Your approximate area is ${area}. You can save the activity without a landmark or retry.`
+      : `${message} You can save the activity without a landmark or retry.`,
+  };
 }

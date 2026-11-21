@@ -1,4 +1,4 @@
-import { JournalActivity } from "@/context/journal-context";
+import type { JournalActivity } from "@/context/journal-context";
 
 /**
  * A time window during which a place is available.
@@ -25,6 +25,7 @@ export type TravelTimeData = {
   from: string;
   to: string;
   durationMinutes: number;
+  distanceMeters?: number;
 };
 
 /**
@@ -98,6 +99,57 @@ export type ReplanningResult = {
   explanation: string;
 };
 
+export type TripReplanningDay = {
+  id: string;
+  date: string;
+  title: string;
+  activities: ReplanningActivity[];
+  returnDeadline?: string;
+};
+
+export type TripActivityScheduleChange = {
+  activityId: string;
+  title: string;
+  priority: ReplanningActivity["priority"];
+  originalDayId: string;
+  originalDate: string;
+  originalTime: string;
+  proposedDayId: string;
+  proposedDate: string;
+  proposedTime: string;
+  reason: string;
+};
+
+export type TripReplanningResult = {
+  success: boolean;
+  isFeasible: boolean;
+  changes: TripActivityScheduleChange[];
+  days: TripDayProposal[];
+  warnings: string[];
+  explanation: string;
+};
+
+export type TripActivityProposal = {
+  activity: ReplanningActivity;
+  proposedTime: string;
+  originalDate?: string;
+  canMoveToLaterDay?: boolean;
+  status: "fixed" | "completed" | "in-progress" | "past" | "scheduled" | "unscheduled";
+  reason?: string;
+  incomingTravel?: TravelTimeData;
+};
+
+export type TripDayProposal = {
+  id: string;
+  date: string;
+  title: string;
+  activities: TripActivityProposal[];
+  warnings: string[];
+  isFeasible: boolean;
+  returnTravel?: TravelTimeData;
+  alternatives?: AlternativePlace[];
+};
+
 /**
  * Input required to replan one itinerary day.
  */
@@ -128,5 +180,19 @@ export type ReplanningInput = {
   /**
    * Hotel or accommodation location.
    */
+  returnLocation: string;
+};
+
+export type TripReplanningInput = {
+  days: TripReplanningDay[];
+  travelTimes: TravelTimeData[];
+  startingLocationId?: string;
+  dayTravelData?: Record<string, {
+    travelTimes: TravelTimeData[];
+    routeOrigins: Record<string, string>;
+    warnings: string[];
+  }>;
+  currentDate: string;
+  currentTime: string;
   returnLocation: string;
 };

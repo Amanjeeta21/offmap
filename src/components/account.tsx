@@ -307,7 +307,7 @@ export default function AccountScreen() {
             <Text style={styles.eyebrow}>BEHIND EVERY JOURNEY</Text>
 
             <Text style={styles.title}>
-              The Traveller's{"\n"}
+              The Traveller&apos;s{"\n"}
               <Text style={styles.titleAccent}>Corner.</Text>
             </Text>
 

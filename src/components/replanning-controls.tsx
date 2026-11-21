@@ -2,19 +2,23 @@ import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useEffect, useState } from "react";
 import {
-    ActivityIndicator,
-    Alert,
-    Modal,
-    Pressable,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  ActivityIndicator,
+  Alert,
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from "react-native";
 
 import { Colors, Radius, Spacing } from "@/constants/theme";
 import { JournalActivity, useJournals } from "@/context/journal-context";
+import {
+  findLocationServiceError,
+  openLocationSettings,
+} from "@/services/location-service";
 import { replanTrip } from "@/services/replanning/replanning-service";
 import { ReplanningActivity, ReplanningResult } from "@/types/replanning";
 
@@ -171,12 +175,54 @@ export default function ReplanningControls({
       setResult(proposed);
       setShowPreview(true);
     } catch (error) {
-      Alert.alert(
-        "Replanning unavailable",
-        error instanceof Error
-          ? error.message
-          : "Something went wrong while recalculating your itinerary.",
-      );
+      const locationError = findLocationServiceError(error);
+
+      if (locationError) {
+        if (
+          locationError.code === "LOCATION_SERVICES_DISABLED" ||
+          locationError.code === "PERMISSION_DENIED"
+        ) {
+          const isGpsDisabled =
+            locationError.code === "LOCATION_SERVICES_DISABLED";
+
+          Alert.alert(
+            isGpsDisabled
+              ? "Location Services are off"
+              : "Location permission needed",
+            locationError.message,
+            [
+              {
+                text: "Cancel",
+                style: "cancel",
+              },
+              {
+                text: isGpsDisabled
+                  ? "Open Location Settings"
+                  : "Open App Settings",
+                onPress: async () => {
+                  try {
+                    await openLocationSettings();
+                  } catch {
+                    Alert.alert(
+                      "Unable to open Settings",
+                      "Please open your device settings manually and enable location access for OFFMAP.",
+                    );
+                  }
+                },
+              },
+            ],
+          );
+        } else {
+          Alert.alert("Location unavailable", locationError.message);
+        }
+      } else {
+        Alert.alert(
+          "Replanning unavailable",
+          error instanceof Error
+            ? error.message
+            : "Something went wrong while recalculating your itinerary.",
+        );
+      }
     } finally {
       setIsReplanning(false);
     }

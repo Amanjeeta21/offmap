@@ -4,9 +4,15 @@ import {
   ReactNode,
   useContext,
   useEffect,
-  useMemo,
+  useLayoutEffect,
+  useRef,
   useState,
 } from "react";
+import { Platform } from "react-native";
+
+import { syncActivityReminders } from "@/services/notification-service";
+
+import type { NearbyPlace } from "@/services/overpass-service";
 
 const STORAGE_KEY = "@offmap/travel-journals";
 
@@ -21,6 +27,7 @@ export type JournalActivity = {
   priority: Priority;
   completed: boolean;
   notes: string;
+  nearestLandmark?: NearbyPlace;
   actualStartAt?: string;
   actualEndAt?: string;
 };
@@ -69,6 +76,7 @@ type JournalContextType = {
     journalId: string,
     accommodationLocation: string,
   ) => void;
+  saveReplannedDays: (expected: TravelJournal, days: JournalDay[]) => Promise<void>;
   deleteJournal: (id: string) => void;
   getJournal: (id: string) => TravelJournal | undefined;
   updateActivity: (
@@ -77,6 +85,7 @@ type JournalContextType = {
     activityId: string,
     changes: Partial<JournalActivity>,
   ) => void;
+  deleteActivity: (journalId: string, dayId: string, activityId: string) => void;
   startActivity: (
     journalId: string,
     dayId: string,
@@ -333,6 +342,8 @@ function migrateJournal(journal: TravelJournal): TravelJournal {
   };
 }
 
+let activitySequence = 0;
+
 const JournalContext = createContext<JournalContextType | undefined>(undefined);
 
 type JournalProviderProps = {
@@ -375,18 +386,60 @@ export function JournalProvider({ children }: JournalProviderProps) {
     loadJournals();
   }, []);
 
+  const latestJournals = useRef(journals);
+  const storageQueue = useRef<Promise<void>>(Promise.resolve());
+
+  useLayoutEffect(() => {
+    latestJournals.current = journals;
+  }, [journals]);
+
+  function persist(snapshot: TravelJournal[]) {
+    const write = storageQueue.current.then(() => {
+      if (latestJournals.current !== snapshot) return;
+      return AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+    });
+    storageQueue.current = write.catch(() => undefined);
+    return write;
+  }
+
   useEffect(() => {
     if (isLoading) return;
+    persist(journals).catch((error) => {
+      console.error("Could not save journals:", error);
+    });
+  }, [journals, isLoading]);
 
-    async function saveJournals() {
-      try {
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(journals));
-      } catch (error) {
-        console.error("Could not save journals:", error);
+  async function saveReplannedDays(expected: TravelJournal, days: JournalDay[]) {
+    const proposed = { ...expected, days };
+    // Check the current journal after earlier writes have settled.
+    const write = storageQueue.current.then(async () => {
+      const snapshot = latestJournals.current;
+      if (!snapshot.includes(expected)) {
+        throw new Error("The itinerary changed. Discard this preview and replan again.");
       }
-    }
+      const next = snapshot.map((journal) => journal === expected ? proposed : journal);
+      try {
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        throw new Error("The itinerary could not be saved. Try again.");
+      }
+      if (!latestJournals.current.includes(expected)) {
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(latestJournals.current));
+        throw new Error("The itinerary changed. Discard this preview and replan again.");
+      }
+      setJournals((current) => current.map((journal) => journal === expected ? proposed : journal));
+    });
+    storageQueue.current = write.catch(() => undefined);
+    await write;
+  }
 
-    saveJournals();
+  // Keep native activity reminders synchronized with saved journals.
+  useEffect(() => {
+    if (isLoading || Platform.OS === "web") return;
+
+    syncActivityReminders(journals).catch((error) => {
+      console.error("Could not synchronize activity reminders:", error);
+    });
   }, [journals, isLoading]);
 
   function addJournal(journal: NewJournal) {
@@ -459,6 +512,23 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
+  function deleteActivity(journalId: string, dayId: string, activityId: string) {
+    setJournals((current) =>
+      current.map((journal) =>
+        journal.id === journalId
+          ? {
+              ...journal,
+              days: journal.days.map((day) =>
+                day.id === dayId
+                  ? { ...day, activities: day.activities.filter((item) => item.id !== activityId) }
+                  : day,
+              ),
+            }
+          : journal,
+      ),
+    );
+  }
+
   function startActivity(
     journalId: string,
     dayId: string,
@@ -494,6 +564,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
     dayId: string,
     activity: Omit<JournalActivity, "id">,
   ) {
+    const activityId = `activity-${Date.now()}-${++activitySequence}`;
     setJournals((current) =>
       current.map((journal) => {
         if (journal.id !== journalId) return journal;
@@ -508,7 +579,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
                     ...day.activities,
                     {
                       ...activity,
-                      id: `activity-${Date.now()}`,
+                      id: activityId,
                     },
                   ],
                 }
@@ -553,23 +624,22 @@ export function JournalProvider({ children }: JournalProviderProps) {
     );
   }
 
-  const value = useMemo(
-    () => ({
-      journals,
-      isLoading,
-      addJournal,
-      updateJournal,
-      updateAccommodationLocation,
-      deleteJournal,
-      getJournal,
-      updateActivity,
-      startActivity,
-      addActivity,
-      updateDayNotes,
-      updateDayDeadline,
-    }),
-    [journals, isLoading],
-  );
+  const value: JournalContextType = {
+    journals,
+    isLoading,
+    addJournal,
+    updateJournal,
+    updateAccommodationLocation,
+    deleteJournal,
+    saveReplannedDays,
+    getJournal,
+    updateActivity,
+    startActivity,
+    deleteActivity,
+    addActivity,
+    updateDayNotes,
+    updateDayDeadline,
+  };
 
   return (
     <JournalContext.Provider value={value}>{children}</JournalContext.Provider>

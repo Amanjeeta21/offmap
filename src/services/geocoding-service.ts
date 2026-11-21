@@ -1,6 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
-import { UserCoordinates } from "@/services/location-service";
+import type { UserCoordinates } from "@/services/location-service";
 
 export type GeocodingResult = {
   name: string;
@@ -8,6 +8,7 @@ export type GeocodingResult = {
 };
 
 type NominatimResult = {
+  error?: string;
   lat: string;
   lon: string;
   display_name: string;
@@ -35,11 +36,19 @@ type PhotonResponse = {
 const NOMINATIM_URL = (
   process.env.EXPO_PUBLIC_NOMINATIM_API_URL ||
   "https://nominatim.openstreetmap.org"
-).replace(/\/+$/, "");
+).replace(/\/(?:search|reverse)\/?$|\/+$/, "");
 
-const PHOTON_URL = "https://photon.komoot.io/api/";
+const PHOTON_URL = (
+  process.env.EXPO_PUBLIC_PHOTON_API_URL ||
+  "https://photon.komoot.io/api/"
+).replace(/(?:\/api)?\/*$/, "/api/");
 
-const CACHE_KEY = "@offmap/geocoding-cache";
+const GEOCODING_HEADERS = {
+  Accept: "application/json",
+  "User-Agent": "OFFMAP mobile app",
+};
+
+const CACHE_KEY = "@offmap/geocoding-cache-v2";
 const REQUEST_INTERVAL = 1100;
 
 let requestQueue: Promise<void> = Promise.resolve();
@@ -54,12 +63,19 @@ function cleanLocation(location: string): string {
     .trim();
 }
 
-function getLocationCandidates(location: string): string[] {
+function getLocationCandidates(location: string, area: string): string[] {
   const cleaned = cleanLocation(location);
 
-  const candidates = [location.trim(), cleaned, `${cleaned}, India`];
+  const candidates = [area && `${cleaned}, ${area}`, location.trim(), cleaned];
 
   return [...new Set(candidates.filter(Boolean))];
+}
+
+function isProviderUnavailable(error: unknown): boolean {
+  return error instanceof TypeError ||
+    (error instanceof Error &&
+      (error.name === "AbortError" || error.name === "TimeoutError" ||
+        /HTTP (401|403|429|5\d\d)\b/.test(error.message)));
 }
 
 async function getCachedLocation(
@@ -115,19 +131,13 @@ async function searchNominatim(query: string): Promise<GeocodingResult | null> {
   const params = new URLSearchParams({
     format: "jsonv2",
     limit: "1",
-    countrycodes: "in",
     q: query,
   });
 
   const response = await fetch(`${NOMINATIM_URL}/search?${params.toString()}`, {
-    headers: {
-      Accept: "application/json",
-    },
+    headers: GEOCODING_HEADERS,
+    signal: AbortSignal.timeout(8000),
   });
-
-  if (response.status === 429) {
-    throw new Error("Nominatim rate limit reached.");
-  }
 
   if (!response.ok) {
     throw new Error(`Nominatim returned HTTP ${response.status}.`);
@@ -135,14 +145,16 @@ async function searchNominatim(query: string): Promise<GeocodingResult | null> {
 
   const data: NominatimResult[] = await response.json();
 
-  if (!data.length) return null;
+  const match = Array.isArray(data) ? data[0] : undefined;
+  if (!match?.lat || !match.lon) return null;
+  const latitude = Number(match.lat);
+  const longitude = Number(match.lon);
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+      Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
 
   return {
-    name: data[0].display_name,
-    coordinates: {
-      latitude: Number(data[0].lat),
-      longitude: Number(data[0].lon),
-    },
+    name: match.display_name,
+    coordinates: { latitude, longitude },
   };
 }
 
@@ -150,13 +162,11 @@ async function searchPhoton(query: string): Promise<GeocodingResult | null> {
   const params = new URLSearchParams({
     q: query,
     limit: "5",
-    lang: "en",
   });
 
   const response = await fetch(`${PHOTON_URL}?${params.toString()}`, {
-    headers: {
-      Accept: "application/json",
-    },
+    headers: GEOCODING_HEADERS,
+    signal: AbortSignal.timeout(8000),
   });
 
   if (!response.ok) {
@@ -175,10 +185,8 @@ async function searchPhoton(query: string): Promise<GeocodingResult | null> {
     return (
       Number.isFinite(latitude) &&
       Number.isFinite(longitude) &&
-      latitude >= 6 &&
-      latitude <= 38 &&
-      longitude >= 68 &&
-      longitude <= 98
+      Math.abs(latitude) <= 90 &&
+      Math.abs(longitude) <= 180
     );
   });
 
@@ -205,8 +213,8 @@ async function searchPhoton(query: string): Promise<GeocodingResult | null> {
   };
 }
 
-async function performGeocoding(location: string): Promise<GeocodingResult> {
-  const candidates = getLocationCandidates(location);
+async function performGeocoding(location: string, area: string, cacheKey: string): Promise<GeocodingResult> {
+  const candidates = getLocationCandidates(location, area);
 
   let nominatimError: string | null = null;
 
@@ -216,12 +224,14 @@ async function performGeocoding(location: string): Promise<GeocodingResult> {
       const result = await searchNominatim(candidate);
 
       if (result) {
-        await saveCachedLocation(location, result);
+        await saveCachedLocation(cacheKey, result);
         return result;
       }
     } catch (error) {
       nominatimError =
         error instanceof Error ? error.message : "Nominatim failed.";
+
+      if (isProviderUnavailable(error)) break;
     }
   }
 
@@ -231,7 +241,7 @@ async function performGeocoding(location: string): Promise<GeocodingResult> {
       const result = await searchPhoton(candidate);
 
       if (result) {
-        await saveCachedLocation(location, result);
+        await saveCachedLocation(cacheKey, result);
         return result;
       }
     } catch (error) {
@@ -243,13 +253,18 @@ async function performGeocoding(location: string): Promise<GeocodingResult> {
     }
   }
 
+  if (nominatimError) {
+    throw new Error(`Location search failed. ${nominatimError}`);
+  }
+
   throw new Error(
-    `Could not identify "${location}". Try including its nearby landmark or city.`,
+    `Could not identify "${location}". It may be missing from the map data.`,
   );
 }
 
 export async function geocodeLocation(
   location: string,
+  area = "",
 ): Promise<GeocodingResult> {
   const query = location.trim();
 
@@ -257,24 +272,42 @@ export async function geocodeLocation(
     throw new Error("Please provide a location to search.");
   }
 
-  const cached = await getCachedLocation(query);
+  const cacheKey = JSON.stringify([query, area]);
+  const cached = await getCachedLocation(cacheKey);
 
   if (cached) return cached;
 
-  const cleaned = cleanLocation(query);
-  const cleanedCache = await getCachedLocation(cleaned);
-
-  if (cleanedCache) {
-    await saveCachedLocation(query, cleanedCache);
-    return cleanedCache;
-  }
-
-  const task = requestQueue.then(() => performGeocoding(query));
+  const task = requestQueue.then(async () =>
+    (await getCachedLocation(cacheKey)) ?? performGeocoding(query, area, cacheKey),
+  );
 
   requestQueue = task.then(
     () => undefined,
     () => undefined,
   );
 
+  return task;
+}
+
+export function reverseGeocodeLocation(coordinates: UserCoordinates): Promise<string | null> {
+  const lat = coordinates.latitude.toFixed(4);
+  const lon = coordinates.longitude.toFixed(4);
+  const key = `reverse:${lat},${lon}`;
+  const task = requestQueue.then(async () => {
+    const cached = await getCachedLocation(key);
+    if (cached) return cached.name;
+    await waitForRateLimit();
+    const params = new URLSearchParams({ lat, lon, format: "jsonv2", zoom: "17" });
+    const response = await fetch(`${NOMINATIM_URL}/reverse?${params}`, {
+      headers: GEOCODING_HEADERS,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!response.ok) throw new Error(`Area lookup returned HTTP ${response.status}.`);
+    const result: NominatimResult = await response.json();
+    if (!result.display_name || result.error) return null;
+    await saveCachedLocation(key, { name: result.display_name, coordinates });
+    return result.display_name;
+  });
+  requestQueue = task.then(() => undefined, () => undefined);
   return task;
 }

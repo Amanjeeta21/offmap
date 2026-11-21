@@ -149,7 +149,7 @@ export default function ExploreScreen() {
 
           <Text style={styles.subtitle}>
             Your journey, your pace, your own little adventure. Start with a
-            date. We'll take it from there.
+            date. We&apos;ll take it from there.
           </Text>
         </View>
 
@@ -355,7 +355,7 @@ export default function ExploreScreen() {
 
             <Text style={styles.modalDecoration}>✳</Text>
             <Text style={styles.eyebrow}>A NEW ADVENTURE AWAITS</Text>
-            <Text style={styles.modalTitle}>Let's plan!</Text>
+            <Text style={styles.modalTitle}>Let&apos;s plan!</Text>
 
             <Text style={styles.modalDescription}>
               {selectedDate ? formatDate(selectedDate) : ""}

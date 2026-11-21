@@ -63,6 +63,7 @@ function buildCoordinates(locations: TravelLocation[]): string {
 async function routingFetch(url: string): Promise<Response> {
   const response = await fetch(url, {
     method: "GET",
+    signal: AbortSignal.timeout(8000),
     headers: {
       Accept: "application/json",
     },
@@ -193,7 +194,9 @@ async function requestTravelMatrix(
       const duration = data.durations?.[fromIndex]?.[toIndex];
       const distance = data.distances?.[fromIndex]?.[toIndex];
 
-      if (duration == null || distance == null) return;
+      if (duration == null || distance == null ||
+          !Number.isFinite(duration) || !Number.isFinite(distance) ||
+          duration < 0 || distance < 0) return;
 
       results.push({
         from: fromLocation.id,
@@ -215,46 +218,42 @@ export async function getTravelTimeMatrix(
 ): Promise<TravelMatrixEntry[]> {
   if (locations.length < 2) return [];
 
-  const results: TravelMatrixEntry[] = [];
-
-  // Request walking routes first.
-  try {
-    const walkingResults = await requestTravelMatrix(locations, "walking");
-
-    results.push(...walkingResults);
-  } catch {
-    // Walking routing may be temporarily unavailable.
-  }
-
-  // Fill missing routes using driving data.
-  const existingRoutes = new Set(
-    results.map((entry) => `${entry.from}->${entry.to}`),
-  );
-
-  const missingRoutes = locations.length * (locations.length - 1);
-
-  if (results.length < missingRoutes) {
-    try {
-      const drivingResults = await requestTravelMatrix(locations, "driving");
-
-      drivingResults.forEach((entry) => {
-        const key = `${entry.from}->${entry.to}`;
-
-        if (!existingRoutes.has(key)) {
-          results.push(entry);
-          existingRoutes.add(key);
-        }
-      });
-    } catch {
-      // Retain all successfully calculated walking routes.
+  const routeKey = (from: string, to: string) => JSON.stringify([from, to]);
+  const preferredModes = new Map<string, TravelMode>();
+  for (const from of locations) {
+    for (const to of locations) {
+      if (from.id === to.id) continue;
+      preferredModes.set(routeKey(from.id, to.id), getTravelMode(from.coordinates, to.coordinates));
     }
   }
 
-  if (results.length === 0) {
+  const routes = new Map<string, TravelMatrixEntry>();
+  const modes = [...new Set(preferredModes.values())];
+  if (modes.length === 1) modes.push(modes[0] === "walking" ? "driving" : "walking");
+
+  for (const mode of modes) {
+    const complete = routes.size === preferredModes.size;
+    const needsPreferredMode = [...preferredModes].some(([key, preferred]) =>
+      preferred === mode && routes.get(key)?.travelMode !== mode,
+    );
+    if (complete && !needsPreferredMode) break;
+
+    try {
+      const matrix = await requestTravelMatrix(locations, mode);
+      for (const route of matrix) {
+        const key = routeKey(route.from, route.to);
+        if (!routes.has(key) || preferredModes.get(key) === mode) routes.set(key, route);
+      }
+    } catch {
+      // Use the other routing profile when it can supply the missing leg.
+    }
+  }
+
+  if (!routes.size) {
     throw new Error(
       "Unable to calculate travel times. Please check your internet connection and try again.",
     );
   }
 
-  return results;
+  return [...routes.values()];
 }

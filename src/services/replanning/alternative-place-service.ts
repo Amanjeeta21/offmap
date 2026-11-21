@@ -71,7 +71,7 @@ export async function getNearbyAlternatives(
       coordinates: currentLocation,
     },
     ...candidates.map((place) => ({
-      id: String(place.id),
+      id: `${place.osmType}/${place.id}`,
       coordinates: {
         latitude: place.latitude,
         longitude: place.longitude,
@@ -98,7 +98,7 @@ export async function getNearbyAlternatives(
   // Build alternatives with both incoming and onward travel times.
   const alternatives: NearbyAlternative[] = candidates
     .map((place) => {
-      const placeId = String(place.id);
+      const placeId = `${place.osmType}/${place.id}`;
 
       const travelTimeFromCurrent = travelTimeMap.get(
         `${CURRENT_LOCATION_ID}->${placeId}`,

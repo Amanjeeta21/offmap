@@ -5,6 +5,7 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
+  Platform,
   NativeScrollEvent,
   NativeSyntheticEvent,
   Pressable,
@@ -14,17 +15,16 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { Colors, Radius, Spacing } from "@/constants/theme";
-import { Priority, useJournals } from "@/context/journal-context";
+import { type JournalActivity, type Priority, type TravelJournal, useJournals } from "@/context/journal-context";
 import { getCurrentLocation } from "@/services/location-service";
-import { replanTrip } from "@/services/replanning/replanning-service";
-import {
-  AlternativePlace,
-  ReplanningActivity,
-  ReplanningResult,
-} from "@/types/replanning";
+import { findNearbyLandmarks, type NearbyPlace } from "@/services/overpass-service";
+import { parseDurationToMinutes } from "@/services/replanning/delay-detector";
+import { replanJournalTrip } from "@/services/replanning/replanning-service";
+import { getTimeInMinutes } from "@/services/replanning/trip-optimizer";
+import type { TravelTimeData, TripActivityProposal, TripReplanningResult } from "@/types/replanning";
 
 type DeadlineFormState = {
   hour: string;
@@ -57,22 +57,48 @@ function getDeadlineFormState(day?: {
   };
 }
 
-function getCurrentTime(): string {
-  const now = new Date();
+function getCurrentTime(now = new Date()): string {
 
   return `${String(now.getHours()).padStart(2, "0")}:${String(
     now.getMinutes(),
   ).padStart(2, "0")}`;
 }
 
+function getCurrentDate(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    "0",
+  )}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+function formatTravel(travel: TravelTimeData) {
+  const distance = travel.distanceMeters;
+  const duration = `${travel.durationMinutes} min`;
+  if (distance === undefined) return duration;
+  return `${duration} / ${distance < 1000 ? `${Math.round(distance)} m` : `${(distance / 1000).toFixed(1)} km`}`;
+}
+
+const proposalLabels: Record<TripActivityProposal["status"], string> = {
+  fixed: "Fixed",
+  completed: "Completed (preserved)",
+  "in-progress": "In progress (preserved)",
+  past: "Past day (preserved)",
+  scheduled: "",
+  unscheduled: "Unscheduled",
+};
+
 export default function JournalScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const { id } = useLocalSearchParams<{ id: string }>();
 
   const {
     getJournal,
+    isLoading,
+    saveReplannedDays,
     updateActivity,
     addActivity,
+    deleteActivity,
     startActivity,
     updateDayDeadline,
     updateAccommodationLocation,
@@ -83,6 +109,14 @@ export default function JournalScreen() {
 
   const [selectedDay, setSelectedDay] = useState(0);
   const [showAddActivity, setShowAddActivity] = useState(false);
+
+  const [editingActivityId, setEditingActivityId] = useState<string | null>(null);
+  const [landmark, setLandmark] = useState<NearbyPlace>();
+  const [nearbyPlaces, setNearbyPlaces] = useState<NearbyPlace[]>([]);
+  const [hasLandmarkMapData, setHasLandmarkMapData] = useState(false);
+  const [landmarkMessage, setLandmarkMessage] = useState<string>();
+  const [isFindingLandmarks, setIsFindingLandmarks] = useState(false);
+  const landmarkRequest = useRef(0);
 
   const [time, setTime] = useState("");
   const [title, setTitle] = useState("");
@@ -99,13 +133,17 @@ export default function JournalScreen() {
     () => journal?.accommodationLocation ?? "",
   );
 
-  const [replanningResult, setReplanningResult] =
-    useState<ReplanningResult | null>(null);
-  const [showReplanningPreview, setShowReplanningPreview] = useState(false);
-
-  const [selectedAlternatives, setSelectedAlternatives] = useState<
-    Record<string, AlternativePlace>
-  >({});
+  const [replanningPreview, setReplanningPreview] = useState<{
+    result: TripReplanningResult;
+    journal: TravelJournal;
+    date: string;
+  } | null>(null);
+  const replanningResult = replanningPreview?.result;
+  const replanningSnapshot = replanningPreview?.journal;
+  const showReplanningPreview = Boolean(replanningPreview);
+  const [isSavingPlan, setIsSavingPlan] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
+  const [savedPlan, setSavedPlan] = useState(false);
 
   const safeSelectedDay =
     days.length === 0 ? 0 : Math.min(selectedDay, days.length - 1);
@@ -132,60 +170,112 @@ export default function JournalScreen() {
 
   function handleSelectDay(index: number) {
     setSelectedDay(index);
-    setShowAddActivity(false);
+    closeActivityForm();
     syncDeadlineFromDay(days[index]);
-    setReplanningResult(null);
-    setShowReplanningPreview(false);
-    setSelectedAlternatives({});
+    setReplanningPreview(null);
   }
 
   if (!journal) {
     return (
       <SafeAreaView style={styles.container}>
-        <Text style={styles.error}>Journal not found.</Text>
+        {isLoading ? <ActivityIndicator color={Colors.primary} /> : (
+          <Text style={styles.error}>Journal not found.</Text>
+        )}
       </SafeAreaView>
     );
   }
 
   const currentJournal = journal;
   const currentJournalId = currentJournal.id;
-
-  function resetActivityForm() {
-    setTime("");
-    setTitle("");
-    setLocation("");
-    setDuration("");
-    setPriority("Medium");
-    setNotes("");
+  function openActivityForm(activity?: JournalActivity) {
+    landmarkRequest.current += 1;
+    setEditingActivityId(activity?.id ?? null);
+    setTime(activity?.time ?? "");
+    setTitle(activity?.title ?? "");
+    setLocation(activity?.location ?? "");
+    setDuration(activity?.duration ?? "");
+    setPriority(activity?.priority ?? "Medium");
+    setNotes(activity?.notes ?? "");
+    setLandmark(activity?.nearestLandmark);
+    setNearbyPlaces([]);
+    setHasLandmarkMapData(false);
+    setLandmarkMessage(undefined);
+    setIsFindingLandmarks(false);
+    setShowAddActivity(true);
   }
 
-  function handleAddActivity() {
-    if (!day) return;
+  function closeActivityForm() {
+    landmarkRequest.current += 1;
+    setShowAddActivity(false);
+  }
 
-    if (!title.trim() || !time.trim()) {
-      Alert.alert(
-        "Missing information",
-        "Please enter at least the time and activity title.",
-      );
+  async function handleFindLandmarks() {
+    const request = ++landmarkRequest.current;
+    setIsFindingLandmarks(true);
+    setLandmarkMessage(undefined);
+    setNearbyPlaces([]);
+    setHasLandmarkMapData(false);
+    try {
+      const position = await getCurrentLocation(true);
+      if (request !== landmarkRequest.current) return;
+      if (position.accuracy === null || !Number.isFinite(position.accuracy) || position.accuracy > 50) {
+        setLandmarkMessage("GPS accuracy is too low. Move to an open area or enable precise location, then try again.");
+        return;
+      }
+      const results = await findNearbyLandmarks(position);
+      if (request !== landmarkRequest.current) return;
+      setNearbyPlaces(results.places);
+      setHasLandmarkMapData(results.hasMapData);
+      setLandmarkMessage(results.message);
+    } catch (error) {
+      if (request === landmarkRequest.current) {
+        setLandmarkMessage(error instanceof Error ? error.message : "Location is unavailable. Try again.");
+      }
+    } finally {
+      if (request === landmarkRequest.current) setIsFindingLandmarks(false);
+    }
+  }
+
+  function handleSaveActivity() {
+    if (!day) return;
+    const existing = day.activities.find((item) => item.id === editingActivityId);
+    if (editingActivityId && !existing) return;
+    if (!title.trim() || (time.trim() !== existing?.time && getTimeInMinutes(time) === null)) {
+      Alert.alert("Check activity details", "Enter an activity name and a valid time, such as 9:00 AM or 14:30.");
       return;
     }
-
-    addActivity(currentJournalId, day.id, {
+    if (duration.trim() && duration.trim() !== existing?.duration && parseDurationToMinutes(duration) <= 0) {
+      Alert.alert("Check duration", "Enter a duration such as 45 min or 1 hour.");
+      return;
+    }
+    const fields = {
       time: time.trim(),
       title: title.trim(),
       location: location.trim(),
       duration: duration.trim(),
       priority,
-      completed: false,
       notes: notes.trim(),
-    });
+      nearestLandmark: landmark,
+    };
+    if (existing) {
+      updateActivity(currentJournalId, day.id, existing.id, fields);
+    } else {
+      addActivity(currentJournalId, day.id, { ...fields, completed: false });
+    }
+    closeActivityForm();
+  }
 
-    const addedTitle = title.trim();
-
-    resetActivityForm();
-    setShowAddActivity(false);
-
-    Alert.alert("Activity added", `${addedTitle} was added to ${day.title}.`);
+  function confirmDeleteActivity(dayId: string, activity: JournalActivity) {
+    const message = `Delete "${activity.title}"?`;
+    const remove = () => deleteActivity(currentJournalId, dayId, activity.id);
+    if (Platform.OS === "web") {
+      if (globalThis.confirm(message)) remove();
+      return;
+    }
+    Alert.alert("Delete activity", message, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Delete", style: "destructive", onPress: remove },
+    ]);
   }
 
   function handleStartActivity(activityId: string) {
@@ -304,158 +394,79 @@ export default function JournalScreen() {
   async function handleReplan() {
     if (isReplanning) return;
 
-    if (!day) {
-      Alert.alert("No itinerary", "Add an itinerary day before replanning.");
-      return;
-    }
-
-    if (day.activities.length === 0) {
-      Alert.alert(
-        "No activities",
-        "Add some activities to this day before replanning.",
-      );
-      return;
-    }
-
-    if (!currentJournal.accommodationLocation?.trim()) {
-      setAccommodationInput("");
-      setShowAccommodationEditor(true);
-
-      Alert.alert(
-        "Accommodation needed",
-        "Add your accommodation location first. OFFMAP needs it to calculate your return journey.",
-      );
-      return;
-    }
-
-    if (!day.returnDeadline) {
-      Alert.alert(
-        "Return deadline needed",
-        "Save your return deadline before replanning this day.",
-      );
-      return;
-    }
-
+    const now = new Date();
+    const currentDate = getCurrentDate(now);
     try {
       setIsReplanning(true);
-      setReplanningResult(null);
-      setSelectedAlternatives({});
-
-      // Check location permission before requesting route information.
-      await getCurrentLocation();
-
-      const result = await replanTrip({
-        activities: day.activities as ReplanningActivity[],
-        currentTime: getCurrentTime(),
-        returnDeadline: day.returnDeadline,
-        returnLocation: currentJournal.accommodationLocation,
+      setReplanningPreview(null);
+      setSaveMessage("");
+      setSavedPlan(false);
+      const result = await replanJournalTrip({
+        days: currentJournal.days,
+        currentDate,
+        currentTime: getCurrentTime(now),
+        returnLocation: currentJournal.accommodationLocation ?? "",
+        destination: currentJournal.destination,
       });
-
-      setReplanningResult(result);
-      setShowReplanningPreview(true);
+      setReplanningPreview({ result, journal: currentJournal, date: currentDate });
     } catch (error) {
       Alert.alert(
         "Replanning unavailable",
-        error instanceof Error
-          ? error.message
-          : "OFFMAP could not calculate a new itinerary. Please try again.",
+        error instanceof Error ? error.message : "OFFMAP could not calculate a new itinerary. Try again.",
       );
     } finally {
       setIsReplanning(false);
     }
   }
 
-  function handleSelectAlternative(
-    activityId: string,
-    alternative: AlternativePlace,
-  ) {
-    setSelectedAlternatives((current) => ({
-      ...current,
-      [activityId]: alternative,
-    }));
-  }
-
   function handleDiscardReplanning() {
-    setShowReplanningPreview(false);
-    setReplanningResult(null);
-    setSelectedAlternatives({});
+    if (isSavingPlan) return;
+    setSaveMessage("");
+    setReplanningPreview(null);
   }
 
-  function handleAcceptReplanning() {
-    if (!day || !replanningResult) return;
-
-    // Only proposed schedule changes are applied here.
-    // Completed and active activities are not changed.
-    for (const change of replanningResult.changes) {
-      const activity = day.activities.find(
-        (item) => item.id === change.activityId,
-      );
-
-      if (!activity || activity.completed) continue;
-
-      const isInProgress =
-        !!activity.actualStartAt &&
-        !activity.actualEndAt &&
-        !activity.completed;
-
-      if (isInProgress) continue;
-
-      const selectedAlternative = selectedAlternatives[activity.id];
-
-      updateActivity(currentJournalId, day.id, activity.id, {
-        time: change.proposedTime,
-        ...(selectedAlternative
-          ? {
-              title: `Visit ${selectedAlternative.name}`,
-              location: selectedAlternative.location,
-            }
-          : {}),
-      });
+  const proposedDays = new Map(replanningResult?.days.map((day) => [day.id, day]));
+  const updatedDays = replanningSnapshot?.days.map((savedDay) => {
+    const proposal = proposedDays.get(savedDay.id);
+    if (!proposal?.isFeasible || !replanningPreview || proposal.date < replanningPreview.date) {
+      return savedDay;
     }
 
-    // Apply a selected nearby replacement even if the original activity
-    // did not receive a schedule change.
-    for (const [activityId, alternative] of Object.entries(
-      selectedAlternatives,
-    )) {
-      const activity = day.activities.find((item) => item.id === activityId);
-
-      if (!activity || activity.completed) continue;
-
-      const isInProgress =
-        !!activity.actualStartAt &&
-        !activity.actualEndAt &&
-        !activity.completed;
-
-      if (isInProgress) continue;
-
-      const hasScheduleChange = replanningResult.changes.some(
-        (change) => change.activityId === activityId,
-      );
-
-      if (!hasScheduleChange) {
-        updateActivity(currentJournalId, day.id, activityId, {
-          title: `Visit ${alternative.name}`,
-          location: alternative.location,
-          time: activity.time,
-        });
-      }
-    }
-
-    setShowReplanningPreview(false);
-    setReplanningResult(null);
-    setSelectedAlternatives({});
-
-    Alert.alert(
-      "Itinerary updated",
-      "Your accepted itinerary changes have been saved.",
+    const activities = proposal.activities.map(({ activity, proposedTime }) =>
+      activity.time === proposedTime ? activity : { ...activity, time: proposedTime },
     );
-  }
+    const hasChanges = activities.length !== savedDay.activities.length ||
+      activities.some((activity, index) => activity !== savedDay.activities[index]);
+    return hasChanges ? { ...savedDay, activities } : savedDay;
+  });
+  const canAccept = Boolean(updatedDays?.some((day, index) => day !== replanningSnapshot?.days[index]));
 
-  const selectedDayChanges = replanningResult?.changes ?? [];
-  const selectedDayUnscheduled = replanningResult?.unscheduledActivities ?? [];
-  const selectedDayAlternatives =
-    replanningResult?.alternativeSuggestions ?? [];
+  async function handleAcceptReplanning() {
+    if (!canAccept || !updatedDays || isSavingPlan) return;
+    if (replanningSnapshot !== currentJournal) {
+      handleDiscardReplanning();
+      setSaveMessage("The itinerary changed. Replan again to review the latest activities.");
+      return;
+    }
+
+    setSaveMessage("");
+    setIsSavingPlan(true);
+    try {
+      await saveReplannedDays(currentJournal, updatedDays);
+      setReplanningPreview(null);
+      setSavedPlan(true);
+      setSaveMessage("Itinerary changes saved.");
+      const changedDayIndex = updatedDays.findIndex((day, index) => day !== currentJournal.days[index]);
+      if (changedDayIndex >= 0 && updatedDays[safeSelectedDay] === currentJournal.days[safeSelectedDay]) {
+        setSelectedDay(changedDayIndex);
+        syncDeadlineFromDay(updatedDays[changedDayIndex]);
+      }
+    } catch (error) {
+      setSaveMessage(error instanceof Error ? error.message : "The itinerary could not be saved. Try again.");
+    } finally {
+      setIsSavingPlan(false);
+    }
+  }
 
   return (
     <SafeAreaView style={styles.container}>
@@ -494,6 +505,20 @@ export default function JournalScreen() {
           </View>
         </View>
 
+        {saveMessage && !showReplanningPreview ? (
+          <View style={styles.savedPlanMessage}>
+            <Text accessibilityLiveRegion="polite" style={styles.previewReason}>{saveMessage}</Text>
+            {savedPlan ? (
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => router.navigate({ pathname: "/itinerary", params: { journalId: currentJournal.id } })}
+                style={styles.savedPlanLink}
+              >
+                <Text style={styles.previewDiscardText}>View itinerary</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ) : null}
         <Text style={styles.eyebrow}>TRAVEL JOURNAL</Text>
         <Text style={styles.title}>{currentJournal.title}</Text>
         <Text style={styles.destination}>{currentJournal.destination}</Text>
@@ -571,107 +596,9 @@ export default function JournalScreen() {
                   <Text style={styles.dayNotes}>{day.notes}</Text>
                 ) : null}
 
-                {!showAddActivity ? (
-                  <Pressable
-                    style={styles.addButton}
-                    onPress={() => setShowAddActivity(true)}
-                  >
-                    <Text style={styles.addButtonText}>+ ADD ACTIVITY</Text>
-                  </Pressable>
-                ) : (
-                  <View style={styles.form}>
-                    <Text style={styles.formTitle}>Add Activity</Text>
-
-                    <Text style={styles.label}>TIME</Text>
-                    <TextInput
-                      value={time}
-                      onChangeText={setTime}
-                      placeholder="e.g. 9:00 AM"
-                      placeholderTextColor={Colors.muted}
-                      style={styles.input}
-                    />
-
-                    <Text style={styles.label}>ACTIVITY</Text>
-                    <TextInput
-                      value={title}
-                      onChangeText={setTitle}
-                      placeholder="e.g. Visit Jagannath Temple"
-                      placeholderTextColor={Colors.muted}
-                      style={styles.input}
-                    />
-
-                    <Text style={styles.label}>LOCATION</Text>
-                    <TextInput
-                      value={location}
-                      onChangeText={setLocation}
-                      placeholder="e.g. Grand Road"
-                      placeholderTextColor={Colors.muted}
-                      style={styles.input}
-                    />
-
-                    <Text style={styles.label}>DURATION</Text>
-                    <TextInput
-                      value={duration}
-                      onChangeText={setDuration}
-                      placeholder="e.g. 2 hours"
-                      placeholderTextColor={Colors.muted}
-                      style={styles.input}
-                    />
-
-                    <Text style={styles.label}>PRIORITY</Text>
-
-                    <View style={styles.priorityRow}>
-                      {(["High", "Medium", "Low"] as Priority[]).map((item) => (
-                        <Pressable
-                          key={item}
-                          onPress={() => setPriority(item)}
-                          style={[
-                            styles.priorityButton,
-                            priority === item && styles.selectedPriority,
-                          ]}
-                        >
-                          <Text
-                            style={[
-                              styles.priorityButtonText,
-                              priority === item && styles.selectedPriorityText,
-                            ]}
-                          >
-                            {item}
-                          </Text>
-                        </Pressable>
-                      ))}
-                    </View>
-
-                    <Text style={styles.label}>NOTES</Text>
-                    <TextInput
-                      value={notes}
-                      onChangeText={setNotes}
-                      placeholder="Add some notes..."
-                      placeholderTextColor={Colors.muted}
-                      style={[styles.input, styles.notesInput]}
-                      multiline
-                    />
-
-                    <View style={styles.formButtons}>
-                      <Pressable
-                        style={styles.cancelButton}
-                        onPress={() => {
-                          resetActivityForm();
-                          setShowAddActivity(false);
-                        }}
-                      >
-                        <Text style={styles.cancelText}>Cancel</Text>
-                      </Pressable>
-
-                      <Pressable
-                        style={styles.saveButton}
-                        onPress={handleAddActivity}
-                      >
-                        <Text style={styles.saveText}>Save Activity</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-                )}
+                <Pressable style={styles.addButton} onPress={() => openActivityForm()}>
+                  <Text style={styles.addButtonText}>+ ADD ACTIVITY</Text>
+                </Pressable>
 
                 {day.activities.length > 0 ? (
                   day.activities.map((activity) => {
@@ -709,6 +636,14 @@ export default function JournalScreen() {
                             >
                               {activity.priority}
                             </Text>
+                            <View style={styles.activityActions}>
+                              <Pressable onPress={() => openActivityForm(activity)} accessibilityRole="button" accessibilityLabel={`Edit ${activity.title}`} hitSlop={8}>
+                                <Ionicons name="pencil-outline" size={18} color={Colors.primary} />
+                              </Pressable>
+                              <Pressable onPress={() => confirmDeleteActivity(day.id, activity)} accessibilityRole="button" accessibilityLabel={`Delete ${activity.title}`} hitSlop={8}>
+                                <Ionicons name="trash-outline" size={18} color={Colors.accent} />
+                              </Pressable>
+                            </View>
                           </View>
 
                           <Text
@@ -724,6 +659,10 @@ export default function JournalScreen() {
                             <Text style={styles.location}>
                               {activity.location}
                             </Text>
+                          ) : null}
+
+                          {activity.nearestLandmark ? (
+                            <Text style={styles.location}>Nearest landmark / {activity.nearestLandmark.name}</Text>
                           ) : null}
 
                           {activity.duration ? (
@@ -936,6 +875,150 @@ export default function JournalScreen() {
         )}
       </ScrollView>
 
+      <Modal visible={showAddActivity} onRequestClose={closeActivityForm} animationType="slide">
+        <View style={{ flex: 1, backgroundColor: Colors.background, paddingTop: insets.top, paddingBottom: insets.bottom }}>
+          <ScrollView keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets contentContainerStyle={styles.content}>
+            <View style={styles.form}>
+              <Text style={styles.formTitle}>{editingActivityId ? "Edit Activity" : "Add Activity"}</Text>
+
+              <Text style={styles.label}>TIME</Text>
+              <TextInput
+                accessibilityLabel="Scheduled time"
+                value={time}
+                onChangeText={setTime}
+                placeholder="e.g. 9:00 AM"
+                placeholderTextColor={Colors.muted}
+                style={styles.input}
+              />
+
+              <Text style={styles.label}>ACTIVITY</Text>
+              <TextInput
+                accessibilityLabel="Activity name"
+                value={title}
+                onChangeText={setTitle}
+                placeholder="e.g. Visit Jagannath Temple"
+                placeholderTextColor={Colors.muted}
+                style={styles.input}
+              />
+
+              <Text style={styles.label}>INTENDED LOCATION</Text>
+              <TextInput
+                accessibilityLabel="Intended location"
+                value={location}
+                onChangeText={setLocation}
+                placeholder="e.g. Grand Road"
+                placeholderTextColor={Colors.muted}
+                style={styles.input}
+              />
+
+              <Text style={styles.label}>NEAREST LANDMARK</Text>
+              {landmark ? (
+                <View style={styles.landmarkAction}>
+                  <Text style={[styles.location, { flex: 1 }]}>{landmark.name}</Text>
+                  <Pressable onPress={() => setLandmark(undefined)} accessibilityLabel="Remove landmark" hitSlop={8}>
+                    <Ionicons name="close-circle-outline" size={22} color={Colors.accent} />
+                  </Pressable>
+                </View>
+              ) : null}
+              <Pressable style={styles.landmarkAction} onPress={handleFindLandmarks} disabled={isFindingLandmarks} accessibilityRole="button">
+                {isFindingLandmarks ? <ActivityIndicator size="small" color={Colors.primary} /> :
+                  <Ionicons name="locate-outline" size={20} color={Colors.primary} />}
+                <Text style={styles.previewItemTitle}>
+                  {isFindingLandmarks ? "Finding places near you..." : "Find places near me"}
+                </Text>
+              </Pressable>
+              {landmarkMessage ? (
+                <Text accessibilityLiveRegion="polite" style={styles.previewReason}>{landmarkMessage}</Text>
+              ) : null}
+              {nearbyPlaces.map((place, index) => {
+                const selected = landmark?.id === place.id && landmark?.osmType === place.osmType;
+                return (
+                  <Pressable
+                    key={`${place.osmType}-${place.id}`}
+                    style={styles.landmarkAction}
+                    onPress={() => setLandmark(place)}
+                    accessibilityRole="radio"
+                    accessibilityState={{ selected }}
+                  >
+                    <Ionicons name={selected ? "radio-button-on" : "radio-button-off"} size={19} color={Colors.accent} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.previewItemTitle}>{place.name}</Text>
+                      <Text style={styles.previewReason}>
+                        {place.category} / about {place.distance} m{index === 0 ? " / Suggested" : ""}
+                      </Text>
+                    </View>
+                  </Pressable>
+                );
+              })}
+              {hasLandmarkMapData ? (
+                <Text style={styles.previewFootnote}>Map data © OpenStreetMap contributors</Text>
+              ) : null}
+
+              <Text style={styles.label}>DURATION</Text>
+              <TextInput
+                accessibilityLabel="Duration"
+                value={duration}
+                onChangeText={setDuration}
+                placeholder="e.g. 2 hours"
+                placeholderTextColor={Colors.muted}
+                style={styles.input}
+              />
+
+              <Text style={styles.label}>PRIORITY</Text>
+
+              <View style={styles.priorityRow}>
+                {(["High", "Medium", "Low"] as Priority[]).map((item) => (
+                  <Pressable
+                    key={item}
+                    onPress={() => setPriority(item)}
+                    style={[
+                      styles.priorityButton,
+                      priority === item && styles.selectedPriority,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.priorityButtonText,
+                        priority === item && styles.selectedPriorityText,
+                      ]}
+                    >
+                      {item}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+
+              <Text style={styles.label}>NOTES</Text>
+              <TextInput
+                accessibilityLabel="Notes"
+                value={notes}
+                onChangeText={setNotes}
+                placeholder="Add some notes..."
+                placeholderTextColor={Colors.muted}
+                style={[styles.input, styles.notesInput]}
+                multiline
+              />
+
+              <View style={styles.formButtons}>
+                <Pressable
+                  style={styles.cancelButton}
+                  onPress={closeActivityForm}
+                >
+                  <Text style={styles.cancelText}>Cancel</Text>
+                </Pressable>
+
+                <Pressable
+                  style={styles.saveButton}
+                  onPress={handleSaveActivity}
+                >
+                  <Text style={styles.saveText}>Save Activity</Text>
+                </Pressable>
+              </View>
+            </View>
+          </ScrollView>
+        </View>
+      </Modal>
+
       {/* Accommodation editor */}
       <Modal
         visible={showAccommodationEditor}
@@ -985,7 +1068,7 @@ export default function JournalScreen() {
       <Modal
         visible={showReplanningPreview}
         transparent
-        animationType="slide"
+        animationType="fade"
         onRequestClose={handleDiscardReplanning}
       >
         <View style={styles.modalOverlay}>
@@ -993,14 +1076,16 @@ export default function JournalScreen() {
             <View style={styles.previewHeader}>
               <View style={styles.previewHeaderContent}>
                 <Text style={styles.modalEyebrow}>OFFMAP ROUTE UPDATE</Text>
-                <Text style={styles.previewTitle}>Your revised day</Text>
+                <Text style={styles.previewTitle}>Your revised trip</Text>
                 <Text style={styles.previewSubtitle}>
-                  Review the suggested changes before saving.
+                  Review the day-by-day changes before saving.
                 </Text>
               </View>
 
               <Pressable
                 onPress={handleDiscardReplanning}
+                disabled={isSavingPlan}
+                accessibilityLabel="Close replanning preview"
                 style={styles.closeButton}
               >
                 <Ionicons name="close" size={22} color={Colors.primary} />
@@ -1013,209 +1098,102 @@ export default function JournalScreen() {
             >
               {replanningResult ? (
                 <>
-                  <View style={styles.resultSummary}>
-                    <Text style={styles.resultSummaryTitle}>
-                      {replanningResult.isFeasible
-                        ? "Route evaluation complete"
-                        : "Your schedule needs attention"}
-                    </Text>
-                    <Text style={styles.resultSummaryText}>
-                      {replanningResult.explanation}
-                    </Text>
-                  </View>
-
-                  <Text style={styles.previewSectionTitle}>
-                    SCHEDULE CHANGES
+                  <Text style={styles.resultSummaryText}>
+                    {canAccept && replanningResult.changes.length === 0
+                      ? "Review the updated order of your activities before saving."
+                      : replanningResult.explanation}
                   </Text>
-
-                  {selectedDayChanges.length > 0 ? (
-                    selectedDayChanges.map((change) => {
-                      const activity = day?.activities.find(
-                        (item) => item.id === change.activityId,
-                      );
-
-                      return (
-                        <View
-                          key={change.activityId}
-                          style={styles.previewItem}
-                        >
-                          <Text style={styles.previewItemTitle}>
-                            {activity?.title ?? "Activity"}
-                          </Text>
-
+                  {replanningResult.warnings.map((warning) => (
+                    <Text key={warning} style={styles.previewReason}>{warning}</Text>
+                  ))}
+                  {replanningResult.days.length === 0 ? (
+                    <Text style={styles.previewEmpty}>This journal has no trip days.</Text>
+                  ) : null}
+                  {replanningResult.days.map((proposedDay) => (
+                    <View key={proposedDay.id}>
+                      <Text style={styles.previewSectionTitle}>
+                        {formatDate(proposedDay.date)} / {proposedDay.title}
+                      </Text>
+                      {proposedDay.activities.length === 0 ? (
+                        <Text style={styles.previewEmpty}>No activities planned for this day.</Text>
+                      ) : null}
+                      {proposedDay.activities.map(({ activity, proposedTime, originalDate, status, reason, incomingTravel }) => (
+                        <View key={activity.id} style={styles.previewItem}>
+                          <Text style={styles.previewItemTitle}>{activity.title}</Text>
+                          {activity.location ? <Text style={styles.previewReason}>{activity.location}</Text> : null}
                           <View style={styles.changeTimeRow}>
-                            <Text style={styles.oldTime}>
-                              {change.originalTime}
-                            </Text>
-                            <Ionicons
-                              name="arrow-forward"
-                              size={15}
-                              color={Colors.accent}
-                            />
-                            <Text style={styles.newTime}>
-                              {change.proposedTime}
-                            </Text>
+                            {activity.time !== proposedTime || originalDate ? (
+                              <>
+                                <Text style={styles.oldTime}>
+                                  {originalDate ? `${formatDate(originalDate)} ` : ""}{activity.time}
+                                </Text>
+                                <Ionicons name="arrow-forward" size={15} color={Colors.accent} />
+                              </>
+                            ) : null}
+                            <Text style={styles.newTime}>{proposedTime}</Text>
+                            {status !== "scheduled" ? (
+                              <Text style={styles.previewReason}>
+                                {status === "fixed" && activity.priority === "High"
+                                  ? "High priority (fixed)"
+                                  : proposalLabels[status]}
+                              </Text>
+                            ) : null}
                           </View>
-
-                          <Text style={styles.previewReason}>
-                            {change.reason}
-                          </Text>
-                        </View>
-                      );
-                    })
-                  ) : (
-                    <Text style={styles.previewEmpty}>
-                      No activity timing changes were suggested.
-                    </Text>
-                  )}
-
-                  {selectedDayUnscheduled.length > 0 ? (
-                    <>
-                      <Text style={styles.previewSectionTitle}>
-                        ACTIVITIES THAT COULD NOT FIT
-                      </Text>
-
-                      {selectedDayUnscheduled.map((item) => (
-                        <View key={item.activityId} style={styles.warningItem}>
-                          <Text style={styles.previewItemTitle}>
-                            {item.title}
-                          </Text>
-                          <Text style={styles.previewReason}>
-                            {item.reason}
-                          </Text>
-                        </View>
-                      ))}
-                    </>
-                  ) : null}
-
-                  {selectedDayAlternatives.length > 0 ? (
-                    <>
-                      <Text style={styles.previewSectionTitle}>
-                        NEARBY ALTERNATIVES
-                      </Text>
-
-                      {selectedDayAlternatives.map((suggestion) => (
-                        <View
-                          key={suggestion.activityId}
-                          style={styles.alternativeGroup}
-                        >
-                          <Text style={styles.previewItemTitle}>
-                            Instead of: {suggestion.originalTitle}
-                          </Text>
-
-                          {suggestion.alternatives.length > 0 ? (
-                            suggestion.alternatives.map((alternative) => {
-                              const isSelected =
-                                selectedAlternatives[suggestion.activityId]
-                                  ?.name === alternative.name;
-
-                              return (
-                                <Pressable
-                                  key={`${suggestion.activityId}-${alternative.name}`}
-                                  style={[
-                                    styles.alternativeItem,
-                                    isSelected &&
-                                      styles.selectedAlternativeItem,
-                                  ]}
-                                  onPress={() =>
-                                    handleSelectAlternative(
-                                      suggestion.activityId,
-                                      alternative,
-                                    )
-                                  }
-                                >
-                                  <View style={styles.alternativeText}>
-                                    <Text style={styles.alternativeName}>
-                                      {alternative.name}
-                                    </Text>
-                                    <Text style={styles.previewReason}>
-                                      {alternative.reason}
-                                    </Text>
-                                    <Text style={styles.alternativeTravel}>
-                                      {alternative.travelTimeMinutes} min travel
-                                      time
-                                    </Text>
-                                  </View>
-
-                                  <Ionicons
-                                    name={
-                                      isSelected
-                                        ? "checkmark-circle"
-                                        : "ellipse-outline"
-                                    }
-                                    size={22}
-                                    color={
-                                      isSelected
-                                        ? Colors.success
-                                        : Colors.secondary
-                                    }
-                                  />
-                                </Pressable>
-                              );
-                            })
-                          ) : (
-                            <Text style={styles.previewEmpty}>
-                              No suitable nearby alternative was found.
+                          {reason ? <Text style={styles.previewReason}>{reason}</Text> : null}
+                          {incomingTravel && incomingTravel.durationMinutes > 0 ? (
+                            <Text style={styles.previewReason}>
+                              Travel to activity / {formatTravel(incomingTravel)}
                             </Text>
-                          )}
+                          ) : null}
                         </View>
                       ))}
-                    </>
-                  ) : null}
-
-                  {replanningResult.warnings.length > 0 ? (
-                    <>
-                      <Text style={styles.previewSectionTitle}>NOTES</Text>
-
-                      {replanningResult.warnings.map((warning, index) => (
-                        <View
-                          key={`${index}-${warning}`}
-                          style={styles.warningItem}
-                        >
-                          <Ionicons
-                            name="alert-circle-outline"
-                            size={17}
-                            color={Colors.accent}
-                          />
-                          <Text style={styles.previewReason}>{warning}</Text>
-                        </View>
+                      {proposedDay.returnTravel ? (
+                        <Text style={styles.previewReason}>Return to accommodation / {formatTravel(proposedDay.returnTravel)}</Text>
+                      ) : null}
+                      {proposedDay.warnings.map((warning) => (
+                        <Text key={warning} style={styles.previewReason}>{warning}</Text>
                       ))}
-                    </>
-                  ) : null}
-
-                  {replanningResult.totalDelayMinutes > 0 ? (
-                    <Text style={styles.delayText}>
-                      Estimated schedule delay:{" "}
-                      {replanningResult.totalDelayMinutes} minutes
-                    </Text>
-                  ) : null}
-
-                  <Text style={styles.previewFootnote}>
-                    Your original itinerary remains unchanged until you accept
-                    these suggestions.
-                  </Text>
+                      {proposedDay.alternatives?.length ? (
+                        <View>
+                          <Text style={styles.previewSectionTitle}>Nearby alternatives</Text>
+                          {proposedDay.alternatives.map((place) => (
+                            <Text key={`${place.id}-${place.name}`} style={styles.previewReason}>
+                              {place.name} / {place.category} / {place.travelTimeMinutes} min from starting point
+                            </Text>
+                          ))}
+                          <Text style={styles.previewFootnote}>Map data © OpenStreetMap contributors</Text>
+                        </View>
+                      ) : null}
+                    </View>
+                  ))}
                 </>
               ) : null}
             </ScrollView>
 
+            {saveMessage ? (
+              <Text accessibilityLiveRegion="polite" style={styles.previewReason}>{saveMessage}</Text>
+            ) : null}
             <View style={styles.previewActions}>
+              {canAccept ? (
+                <Pressable
+                  accessibilityRole="button"
+                  style={styles.previewDiscardButton}
+                  onPress={handleDiscardReplanning}
+                  disabled={isSavingPlan}
+                >
+                  <Text style={styles.previewDiscardText}>Discard Changes</Text>
+                </Pressable>
+              ) : null}
               <Pressable
-                style={styles.previewDiscardButton}
-                onPress={handleDiscardReplanning}
+                accessibilityRole="button"
+                accessibilityState={{ busy: isSavingPlan }}
+                style={[styles.previewAcceptButton, isSavingPlan && styles.replanButtonDisabled]}
+                onPress={canAccept ? handleAcceptReplanning : handleDiscardReplanning}
+                disabled={isSavingPlan}
               >
-                <Text style={styles.previewDiscardText}>Discard</Text>
-              </Pressable>
-
-              <Pressable
-                style={styles.previewAcceptButton}
-                onPress={handleAcceptReplanning}
-                disabled={
-                  !replanningResult ||
-                  (selectedDayChanges.length === 0 &&
-                    Object.keys(selectedAlternatives).length === 0)
-                }
-              >
-                <Text style={styles.previewAcceptText}>Accept changes</Text>
+                <Text style={styles.previewAcceptText}>
+                  {isSavingPlan ? "Saving..." : canAccept ? "Accept Changes" : "Done"}
+                </Text>
               </Pressable>
             </View>
           </View>
@@ -1956,6 +1934,17 @@ const styles = StyleSheet.create({
     gap: 10,
     marginTop: 18,
   },
+  activityActions: {
+    flexDirection: "row",
+    columnGap: 18,
+    marginLeft: "auto",
+  },
+  landmarkAction: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingVertical: 10,
+  },
   previewCard: {
     width: "100%",
     maxWidth: 560,
@@ -1996,17 +1985,18 @@ const styles = StyleSheet.create({
   },
   previewScroll: {
     flexGrow: 0,
+    flexShrink: 1,
+    minHeight: 0,
   },
-  resultSummary: {
-    backgroundColor: "#F1EEE6",
-    borderRadius: Radius.sm,
-    padding: 13,
-    marginBottom: 17,
+  savedPlanMessage: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    columnGap: 12,
+    marginTop: 12,
   },
-  resultSummaryTitle: {
-    color: Colors.primary,
-    fontSize: 13,
-    fontWeight: "700",
+  savedPlanLink: {
+    paddingVertical: 10,
   },
   resultSummaryText: {
     color: Colors.secondary,
@@ -2060,14 +2050,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 18,
     marginTop: 5,
-  },
-  warningItem: {
-    flexDirection: "row",
-    alignItems: "flex-start",
-    gap: 8,
-    paddingVertical: 9,
-    borderBottomWidth: 1,
-    borderBottomColor: Colors.border,
   },
   alternativeGroup: {
     marginBottom: 12,

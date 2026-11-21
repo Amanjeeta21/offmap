@@ -1,162 +1,131 @@
-import { JournalActivity } from "@/context/journal-context";
+import type { JournalActivity } from "@/context/journal-context";
 import { geocodeLocation } from "@/services/geocoding-service";
-import {
-    getCurrentLocation,
-    UserCoordinates,
-} from "@/services/location-service";
-import { getTravelTimeMatrix, TravelLocation } from "@/services/osrm-service";
-import { TravelTimeData } from "@/types/replanning";
+import { getCurrentLocation, type UserCoordinates } from "@/services/location-service";
+import { getTravelTimeMatrix, type TravelLocation } from "@/services/osrm-service";
+import type { TravelTimeData } from "@/types/replanning";
 
 export const STARTING_LOCATION_ID = "__current_location__";
 
-export type ResolvedActivityLocation = {
+type ResolvedActivityLocation = {
   activityId: string;
   title: string;
   location: string;
   coordinates: UserCoordinates;
 };
 
-export type TravelDataResult = {
-  currentLocation: UserCoordinates;
-  startingLocationId: string;
-  resolvedLocations: ResolvedActivityLocation[];
-  travelTimes: TravelTimeData[];
+type TravelOptions = {
+  currentLocation?: UserCoordinates;
+  additionalLocations?: string[];
+  area?: string;
+  strict?: boolean;
+  geocodingRequests?: Map<string, ReturnType<typeof geocodeLocation>>;
 };
 
-type ParsedLocation = {
-  original: string;
-  destination: string;
-  routeOrigin?: string;
-};
-
-function parseActivityLocation(location: string): ParsedLocation {
+function parseActivityLocation(location: string) {
   const original = location.trim();
+  const parts = original.split(/\s+(?:to|\u2192|->)\s+/i).map((part) => part.trim());
+  if (parts.length === 2 && parts[0] && parts[1]) {
+    return { original, destination: parts[1], routeOrigin: parts[0] };
+  }
+  return { original, destination: original };
+}
 
-  // Recognize common ways of entering a route between two places.
-  const separators = [/\s+to\s+/i, /\s+→\s+/, /\s+->\s+/];
+export async function getDayTravelData(
+  activities: JournalActivity[],
+  options: TravelOptions,
+) {
+  const warnings: string[] = [];
+  const resolvedLocations: ResolvedActivityLocation[] = [];
+  const routeOrigins: Record<string, string> = Object.create(null);
+  const travelLocations = new Map<string, TravelLocation>();
+  const requests = options.geocodingRequests ?? new Map<string, ReturnType<typeof geocodeLocation>>();
+  const resolve = async (name: string) => {
+    const key = name.toLowerCase();
+    let request = requests.get(key);
+    if (!request) {
+      request = geocodeLocation(name, options.area);
+      requests.set(key, request);
+    }
+    try {
+      return (await request).coordinates;
+    } catch (error) {
+      if (options.strict) throw error;
+      const reason = error instanceof Error ? error.message : "Location lookup failed.";
+      const warning = `Couldn't locate "${name}". ${reason}`;
+      if (!warnings.includes(warning)) warnings.push(warning);
+      return undefined;
+    }
+  };
 
-  for (const separator of separators) {
-    const parts = original.split(separator);
+  if (options.currentLocation) {
+    travelLocations.set(STARTING_LOCATION_ID, {
+      id: STARTING_LOCATION_ID,
+      coordinates: options.currentLocation,
+    });
+  }
 
-    if (parts.length === 2 && parts[0].trim() && parts[1].trim()) {
-      return {
-        original,
-        routeOrigin: parts[0].trim(),
-        destination: parts[1].trim(),
-      };
+  for (const activity of activities) {
+    const { original, destination, routeOrigin } = parseActivityLocation(activity.location);
+    if (!destination) continue;
+    const coordinates = await resolve(destination);
+    if (coordinates) {
+      travelLocations.set(original, { id: original, coordinates });
+      resolvedLocations.push({
+        activityId: activity.id,
+        title: activity.title,
+        location: original,
+        coordinates,
+      });
+    }
+    if (routeOrigin) {
+      routeOrigins[original] = routeOrigin;
+      const originCoordinates = await resolve(routeOrigin);
+      if (originCoordinates) {
+        travelLocations.set(routeOrigin, { id: routeOrigin, coordinates: originCoordinates });
+      }
     }
   }
 
+  for (const id of options.additionalLocations ?? []) {
+    if (!id || travelLocations.has(id)) continue;
+    const coordinates = await resolve(id);
+    if (coordinates) travelLocations.set(id, { id, coordinates });
+  }
+
+  let travelTimes: TravelTimeData[] = [];
+  try {
+    travelTimes = await getTravelTimeMatrix([...travelLocations.values()]);
+  } catch (error) {
+    if (options.strict) throw error;
+    warnings.push("The routing service could not calculate travel times for this day. Try again shortly.");
+  }
+
   return {
-    original,
-    destination: original,
+    resolvedLocations,
+    travelTimes,
+    routeOrigins,
+    warnings,
+    startingCoordinates: travelLocations,
   };
 }
 
 export async function getReplanningTravelData(
   activities: JournalActivity[],
-): Promise<TravelDataResult> {
+  additionalLocations: string[] = [],
+) {
   const currentLocation = await getCurrentLocation();
-
-  const activeActivity = activities.find(
-    (activity) =>
-      !!activity.actualStartAt && !activity.actualEndAt && !activity.completed,
+  const active = activities.find((activity) =>
+    activity.actualStartAt && !activity.actualEndAt && !activity.completed,
   );
-
-  const pendingActivities = activities.filter(
-    (activity) => !activity.completed && !!activity.location.trim(),
-  );
-
-  const parsedActivities = pendingActivities.map((activity) => ({
-    activity,
-    parsed: parseActivityLocation(activity.location),
-  }));
-
-  // Collect unique destination and route-origin place names.
-  const uniqueLocations = new Set<string>();
-
-  parsedActivities.forEach(({ parsed }) => {
-    uniqueLocations.add(parsed.destination);
-
-    if (parsed.routeOrigin) {
-      uniqueLocations.add(parsed.routeOrigin);
-    }
+  const data = await getDayTravelData(activities.filter((activity) => !activity.completed), {
+    currentLocation,
+    additionalLocations,
+    strict: true,
   });
-
-  const geocodedLocations = new Map<string, UserCoordinates>();
-
-  // Geocode each individual place, never the complete route phrase.
-  for (const location of uniqueLocations) {
-    const result = await geocodeLocation(location);
-
-    geocodedLocations.set(location, result.coordinates);
-  }
-
-  const resolvedLocations: ResolvedActivityLocation[] = parsedActivities.map(
-    ({ activity, parsed }) => {
-      const coordinates = geocodedLocations.get(parsed.destination);
-
-      if (!coordinates) {
-        throw new Error(`Coordinates unavailable for ${parsed.destination}.`);
-      }
-
-      return {
-        activityId: activity.id,
-        title: activity.title,
-        location: parsed.original,
-        coordinates,
-      };
-    },
-  );
-
-  const activeParsedLocation = activeActivity
-    ? parseActivityLocation(activeActivity.location)
-    : null;
-
-  const startingLocationId =
-    activeParsedLocation?.original || STARTING_LOCATION_ID;
-
-  // Keep the original activity location as an ID so the optimizer
-  // can continue matching its existing activity.location value.
-  const travelLocations: TravelLocation[] = [
-    {
-      id: STARTING_LOCATION_ID,
-      coordinates: currentLocation,
-    },
-    ...parsedActivities.map(({ parsed }) => ({
-      id: parsed.original,
-      coordinates: geocodedLocations.get(parsed.destination)!,
-    })),
-  ];
-
-  // Add route origins as separate locations when an activity
-  // contains a route such as "Assi Ghat to Dashashwamedha Ghat".
-  parsedActivities.forEach(({ parsed }) => {
-    if (!parsed.routeOrigin) return;
-
-    travelLocations.push({
-      id: parsed.routeOrigin,
-      coordinates: geocodedLocations.get(parsed.routeOrigin)!,
-    });
-  });
-
-  // Remove duplicate IDs before requesting the matrix.
-  const uniqueTravelLocations = Array.from(
-    new Map(travelLocations.map((item) => [item.id, item])).values(),
-  );
-
-  const matrix = await getTravelTimeMatrix(uniqueTravelLocations);
-
-  const travelTimes: TravelTimeData[] = matrix.map((entry) => ({
-    from: entry.from,
-    to: entry.to,
-    durationMinutes: entry.durationMinutes,
-  }));
 
   return {
+    ...data,
     currentLocation,
-    startingLocationId,
-    resolvedLocations,
-    travelTimes,
+    startingLocationId: active?.location.trim() || STARTING_LOCATION_ID,
   };
 }
