@@ -10,18 +10,10 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { ExploreInterests } from "@/components/explore-interests";
 import { Colors, Radius, Spacing } from "@/constants/theme";
 
 const weekdays = ["S", "M", "T", "W", "T", "F", "S"];
-
-const interests = [
-  "Culture",
-  "Food",
-  "Adventure",
-  "Nature",
-  "History",
-  "Shopping",
-];
 
 const features = [
   {
@@ -76,7 +68,6 @@ export default function ExploreScreen() {
   });
 
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
-  const [selectedInterest, setSelectedInterest] = useState<string | null>(null);
   const [selectedFeature, setSelectedFeature] = useState<Feature | null>(null);
 
   const year = visibleMonth.getFullYear();
@@ -149,7 +140,7 @@ export default function ExploreScreen() {
 
           <Text style={styles.subtitle}>
             Your journey, your pace, your own little adventure. Start with a
-            date. We'll take it from there.
+            date. We&apos;ll take it from there.
           </Text>
         </View>
 
@@ -254,33 +245,7 @@ export default function ExploreScreen() {
             What does your kind of adventure look like?
           </Text>
 
-          <View style={styles.interestGrid}>
-            {interests.map((interest) => {
-              const isSelected = selectedInterest === interest;
-
-              return (
-                <Pressable
-                  key={interest}
-                  onPress={() =>
-                    setSelectedInterest(isSelected ? null : interest)
-                  }
-                  style={[
-                    styles.interestChip,
-                    isSelected && styles.interestChipSelected,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.interestText,
-                      isSelected && styles.interestTextSelected,
-                    ]}
-                  >
-                    {interest}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
+          <ExploreInterests />
         </View>
 
         {/* OFFMAP Feature Cards */}
@@ -355,7 +320,7 @@ export default function ExploreScreen() {
 
             <Text style={styles.modalDecoration}>✳</Text>
             <Text style={styles.eyebrow}>A NEW ADVENTURE AWAITS</Text>
-            <Text style={styles.modalTitle}>Let's plan!</Text>
+            <Text style={styles.modalTitle}>Let&apos;s plan!</Text>
 
             <Text style={styles.modalDescription}>
               {selectedDate ? formatDate(selectedDate) : ""}
@@ -643,39 +608,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 19,
     textAlign: "center",
-  },
-
-  interestGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "center",
-    gap: 10,
-    width: "100%",
-  },
-
-  interestChip: {
-    backgroundColor: "#203B60",
-    paddingHorizontal: 17,
-    paddingVertical: 12,
-    borderRadius: Radius.sm,
-    borderWidth: 1,
-    borderColor: "#203B60",
-  },
-
-  interestChipSelected: {
-    backgroundColor: Colors.accent,
-    borderColor: Colors.accent,
-  },
-
-  interestText: {
-    color: Colors.white,
-    fontSize: 11,
-    fontWeight: "700",
-    letterSpacing: 0.3,
-  },
-
-  interestTextSelected: {
-    color: Colors.white,
   },
 
   // Feature Cards
