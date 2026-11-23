@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Modal,
   Platform,
   NativeScrollEvent,
@@ -20,10 +21,12 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 import { Colors, Radius, Spacing } from "@/constants/theme";
 import { type JournalActivity, type Priority, type TravelJournal, useJournals } from "@/context/journal-context";
 import { getCurrentLocation } from "@/services/location-service";
+import { getScheduledActivityDate } from "@/services/notification-service";
 import { findNearbyLandmarks, type NearbyPlace } from "@/services/overpass-service";
 import { parseDurationToMinutes } from "@/services/replanning/delay-detector";
 import { replanJournalTrip } from "@/services/replanning/replanning-service";
 import { getTimeInMinutes } from "@/services/replanning/trip-optimizer";
+import { replanVaranasiDemo } from "@/services/replanning/varanasi-demo";
 import type { TravelTimeData, TripActivityProposal, TripReplanningResult } from "@/types/replanning";
 
 type DeadlineFormState = {
@@ -139,6 +142,7 @@ export default function JournalScreen() {
     date: string;
   } | null>(null);
   const replanningResult = replanningPreview?.result;
+  const [selectedAlternatives, setSelectedAlternatives] = useState<Record<string, number>>({});
   const replanningSnapshot = replanningPreview?.journal;
   const showReplanningPreview = Boolean(replanningPreview);
   const [isSavingPlan, setIsSavingPlan] = useState(false);
@@ -148,6 +152,25 @@ export default function JournalScreen() {
   const safeSelectedDay =
     days.length === 0 ? 0 : Math.min(selectedDay, days.length - 1);
   const day = days[safeSelectedDay];
+  const [clock, setClock] = useState(Date.now);
+
+  useEffect(() => {
+    const refresh = () => setClock(Date.now());
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") refresh();
+    });
+    const nextStart = Math.min(...(day?.activities ?? [])
+      .filter((activity) => !activity.completed && !activity.actualStartAt)
+      .map((activity) => getScheduledActivityDate(day.date, activity.time)?.getTime() ?? Infinity)
+      .filter((time) => time > clock));
+    const timeout = Number.isFinite(nextStart)
+      ? setTimeout(refresh, Math.min(2_147_483_647, Math.max(0, nextStart - new Date().getTime())))
+      : undefined;
+    return () => {
+      clearTimeout(timeout);
+      subscription.remove();
+    };
+  }, [day, clock]);
 
   const initialDeadline = getDeadlineFormState(days[0]);
   const [deadlineHour, setDeadlineHour] = useState(initialDeadline.hour);
@@ -187,6 +210,7 @@ export default function JournalScreen() {
 
   const currentJournal = journal;
   const currentJournalId = currentJournal.id;
+  const isVaranasiDemo = currentJournal.isSample && currentJournalId === "varanasi-sample";
   function openActivityForm(activity?: JournalActivity) {
     landmarkRequest.current += 1;
     setEditingActivityId(activity?.id ?? null);
@@ -258,7 +282,10 @@ export default function JournalScreen() {
       nearestLandmark: landmark,
     };
     if (existing) {
-      updateActivity(currentJournalId, day.id, existing.id, fields);
+      updateActivity(currentJournalId, day.id, existing.id, {
+        ...fields,
+        plannedAlternative: fields.location === existing.location ? existing.plannedAlternative : undefined,
+      });
     } else {
       addActivity(currentJournalId, day.id, { ...fields, completed: false });
     }
@@ -302,6 +329,19 @@ export default function JournalScreen() {
       completed: true,
       actualEndAt: new Date().toISOString(),
     });
+  }
+
+  function confirmCompleteActivity(activity: JournalActivity) {
+    const message = `Have you finished ${activity.title}?`;
+    const complete = () => handleCompleteActivity(activity.id);
+    if (Platform.OS === "web") {
+      if (globalThis.confirm(message)) complete();
+      return;
+    }
+    Alert.alert("Complete activity?", message, [
+      { text: "Cancel", style: "cancel" },
+      { text: "Complete", onPress: complete },
+    ]);
   }
 
   function formatActualTime(timestamp: string) {
@@ -395,19 +435,23 @@ export default function JournalScreen() {
     if (isReplanning) return;
 
     const now = new Date();
-    const currentDate = getCurrentDate(now);
+    const currentDate = isVaranasiDemo ? currentJournal.startDate : getCurrentDate(now);
+    const returnLocation = currentJournal.accommodationLocation ?? "";
     try {
       setIsReplanning(true);
       setReplanningPreview(null);
+      setSelectedAlternatives({});
       setSaveMessage("");
       setSavedPlan(false);
-      const result = await replanJournalTrip({
-        days: currentJournal.days,
-        currentDate,
-        currentTime: getCurrentTime(now),
-        returnLocation: currentJournal.accommodationLocation ?? "",
-        destination: currentJournal.destination,
-      });
+      const result = isVaranasiDemo
+        ? replanVaranasiDemo(currentJournal.days, currentDate, returnLocation)
+        : await replanJournalTrip({
+            days: currentJournal.days,
+            currentDate,
+            currentTime: getCurrentTime(now),
+            returnLocation,
+            destination: currentJournal.destination,
+          });
       setReplanningPreview({ result, journal: currentJournal, date: currentDate });
     } catch (error) {
       Alert.alert(
@@ -423,9 +467,14 @@ export default function JournalScreen() {
     if (isSavingPlan) return;
     setSaveMessage("");
     setReplanningPreview(null);
+    setSelectedAlternatives({});
   }
 
-  const proposedDays = new Map(replanningResult?.days.map((day) => [day.id, day]));
+  const previewDays = replanningResult?.days.map((day) => {
+    const choice = day.alternatives?.[selectedAlternatives[day.id]];
+    return choice ? { ...choice.itinerary, alternatives: day.alternatives } : day;
+  });
+  const proposedDays = new Map(previewDays?.map((day) => [day.id, day]));
   const updatedDays = replanningSnapshot?.days.map((savedDay) => {
     const proposal = proposedDays.get(savedDay.id);
     if (!proposal?.isFeasible || !replanningPreview || proposal.date < replanningPreview.date) {
@@ -561,6 +610,9 @@ export default function JournalScreen() {
                 <Pressable
                   key={item.id}
                   onPress={() => handleSelectDay(index)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Day ${index + 1}, ${item.title}`}
+                  accessibilityState={{ selected: index === safeSelectedDay }}
                   style={[
                     styles.dayButton,
                     index === safeSelectedDay && styles.activeDay,
@@ -665,6 +717,10 @@ export default function JournalScreen() {
                             <Text style={styles.location}>Nearest landmark / {activity.nearestLandmark.name}</Text>
                           ) : null}
 
+                          {activity.plannedAlternative ? (
+                            <Text style={styles.location}>Planned alternative / {activity.plannedAlternative.name}</Text>
+                          ) : null}
+
                           {activity.duration ? (
                             <Text style={styles.duration}>
                               Planned: {activity.duration}
@@ -705,37 +761,26 @@ export default function JournalScreen() {
                             </View>
                           ) : null}
 
-                          {!activity.completed && !activity.actualStartAt ? (
-                            <Pressable
-                              style={styles.startButton}
-                              onPress={() => handleStartActivity(activity.id)}
-                            >
-                              <Text style={styles.startButtonText}>
-                                START ACTIVITY
-                              </Text>
-                            </Pressable>
+                          {!activity.completed && !activity.actualStartAt && !activity.actualEndAt ? (
+                            <View>
+                              {(getScheduledActivityDate(day.date, activity.time)?.getTime() ?? Infinity) <= clock ? (
+                                <Text style={styles.trackingText}>Ready to start</Text>
+                              ) : null}
+                              <Pressable
+                                accessibilityRole="button"
+                                style={styles.startButton}
+                                onPress={() => handleStartActivity(activity.id)}
+                              >
+                                <Text style={styles.startButtonText}>START ACTIVITY</Text>
+                              </Pressable>
+                            </View>
                           ) : null}
 
                           {isInProgress ? (
                             <Pressable
+                              accessibilityRole="button"
                               style={styles.completeButton}
-                              onPress={() =>
-                                Alert.alert(
-                                  "Complete activity?",
-                                  `Have you finished ${activity.title}?`,
-                                  [
-                                    {
-                                      text: "Not yet",
-                                      style: "cancel",
-                                    },
-                                    {
-                                      text: "Complete",
-                                      onPress: () =>
-                                        handleCompleteActivity(activity.id),
-                                    },
-                                  ],
-                                )
-                              }
+                              onPress={() => confirmCompleteActivity(activity)}
                             >
                               <Text style={styles.completeButtonText}>
                                 COMPLETE ACTIVITY
@@ -1099,8 +1144,8 @@ export default function JournalScreen() {
               {replanningResult ? (
                 <>
                   <Text style={styles.resultSummaryText}>
-                    {canAccept && replanningResult.changes.length === 0
-                      ? "Review the updated order of your activities before saving."
+                    {canAccept
+                      ? "Review the proposed changes for your trip."
                       : replanningResult.explanation}
                   </Text>
                   {replanningResult.warnings.map((warning) => (
@@ -1109,7 +1154,7 @@ export default function JournalScreen() {
                   {replanningResult.days.length === 0 ? (
                     <Text style={styles.previewEmpty}>This journal has no trip days.</Text>
                   ) : null}
-                  {replanningResult.days.map((proposedDay) => (
+                  {previewDays?.map((proposedDay) => (
                     <View key={proposedDay.id}>
                       <Text style={styles.previewSectionTitle}>
                         {formatDate(proposedDay.date)} / {proposedDay.title}
@@ -1121,6 +1166,9 @@ export default function JournalScreen() {
                         <View key={activity.id} style={styles.previewItem}>
                           <Text style={styles.previewItemTitle}>{activity.title}</Text>
                           {activity.location ? <Text style={styles.previewReason}>{activity.location}</Text> : null}
+                          {activity.plannedAlternative ? (
+                            <Text style={styles.previewReason}>Planned alternative / {activity.plannedAlternative.name}</Text>
+                          ) : null}
                           <View style={styles.changeTimeRow}>
                             {activity.time !== proposedTime || originalDate ? (
                               <>
@@ -1137,6 +1185,8 @@ export default function JournalScreen() {
                                   ? "High priority (fixed)"
                                   : proposalLabels[status]}
                               </Text>
+                            ) : activity.time !== proposedTime || originalDate ? (
+                              <Text style={styles.previewReason}>Rescheduled</Text>
                             ) : null}
                           </View>
                           {reason ? <Text style={styles.previewReason}>{reason}</Text> : null}
@@ -1154,14 +1204,38 @@ export default function JournalScreen() {
                         <Text key={warning} style={styles.previewReason}>{warning}</Text>
                       ))}
                       {proposedDay.alternatives?.length ? (
-                        <View>
-                          <Text style={styles.previewSectionTitle}>Nearby alternatives</Text>
-                          {proposedDay.alternatives.map((place) => (
-                            <Text key={`${place.id}-${place.name}`} style={styles.previewReason}>
-                              {place.name} / {place.category} / {place.travelTimeMinutes} min from starting point
-                            </Text>
-                          ))}
-                          <Text style={styles.previewFootnote}>Map data © OpenStreetMap contributors</Text>
+                        <View style={styles.alternativeGroup}>
+                          <Text style={styles.previewSectionTitle}>
+                            {isVaranasiDemo ? "Sample nearby alternatives" : "Nearby alternatives"}
+                          </Text>
+                          {proposedDay.alternatives.map(({ activityId, place }, index) => {
+                            const selected = selectedAlternatives[proposedDay.id] === index;
+                            const activity = proposedDay.activities.find((item) => item.activity.id === activityId)?.activity;
+                            return (
+                              <Pressable
+                                key={`${activityId}-${place.osmType}-${place.id}`}
+                                accessibilityRole="button"
+                                accessibilityState={{ selected }}
+                                disabled={isSavingPlan}
+                                onPress={() => setSelectedAlternatives((current) => ({
+                                  ...current,
+                                  [proposedDay.id]: selected ? -1 : index,
+                                }))}
+                                style={[styles.alternativeItem, selected && styles.selectedAlternativeItem]}
+                              >
+                                <View style={styles.alternativeText}>
+                                  <Text style={styles.alternativeName}>{place.name}</Text>
+                                  <Text style={styles.alternativeTravel}>{place.category} / {place.distance} m away</Text>
+                                  <Text style={styles.previewReason}>Fits the schedule for {activity?.title}</Text>
+                                </View>
+                                <Text style={styles.previewReason}>{selected ? "Selected" : "Use this place"}</Text>
+                              </Pressable>
+                            );
+                          })}
+                          <Text style={styles.previewFootnote}>Check opening hours before visiting.</Text>
+                          {!isVaranasiDemo ? (
+                            <Text style={styles.previewFootnote}>Map data © OpenStreetMap contributors</Text>
+                          ) : null}
                         </View>
                       ) : null}
                     </View>
@@ -1174,27 +1248,25 @@ export default function JournalScreen() {
               <Text accessibilityLiveRegion="polite" style={styles.previewReason}>{saveMessage}</Text>
             ) : null}
             <View style={styles.previewActions}>
-              {canAccept ? (
-                <Pressable
-                  accessibilityRole="button"
-                  style={styles.previewDiscardButton}
-                  onPress={handleDiscardReplanning}
-                  disabled={isSavingPlan}
-                >
-                  <Text style={styles.previewDiscardText}>Discard Changes</Text>
-                </Pressable>
-              ) : null}
               <Pressable
+                accessibilityRole="button"
+                style={styles.previewDiscardButton}
+                onPress={handleDiscardReplanning}
+                disabled={isSavingPlan}
+              >
+                <Text style={styles.previewDiscardText}>Discard Changes</Text>
+              </Pressable>
+              {canAccept ? <Pressable
                 accessibilityRole="button"
                 accessibilityState={{ busy: isSavingPlan }}
                 style={[styles.previewAcceptButton, isSavingPlan && styles.replanButtonDisabled]}
-                onPress={canAccept ? handleAcceptReplanning : handleDiscardReplanning}
+                onPress={handleAcceptReplanning}
                 disabled={isSavingPlan}
               >
                 <Text style={styles.previewAcceptText}>
-                  {isSavingPlan ? "Saving..." : canAccept ? "Accept Changes" : "Done"}
+                  {isSavingPlan ? "Saving..." : "Accept Changes"}
                 </Text>
-              </Pressable>
+              </Pressable> : null}
             </View>
           </View>
         </View>

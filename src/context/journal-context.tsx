@@ -4,11 +4,11 @@ import {
   ReactNode,
   useContext,
   useEffect,
-  useLayoutEffect,
+  useCallback,
   useRef,
   useState,
 } from "react";
-import { Platform } from "react-native";
+import { AppState, Platform } from "react-native";
 
 import { syncActivityReminders } from "@/services/notification-service";
 
@@ -17,6 +17,13 @@ import type { NearbyPlace } from "@/services/overpass-service";
 const STORAGE_KEY = "@offmap/travel-journals";
 
 export type Priority = "High" | "Medium" | "Low";
+
+export type MemoryPhoto = { fileName: string } | { dataUri: string };
+
+export type ActivityMemory = {
+  photo: MemoryPhoto;
+  note?: string;
+};
 
 export type JournalActivity = {
   id: string;
@@ -28,6 +35,8 @@ export type JournalActivity = {
   completed: boolean;
   notes: string;
   nearestLandmark?: NearbyPlace;
+  plannedAlternative?: NearbyPlace;
+  memory?: ActivityMemory;
   actualStartAt?: string;
   actualEndAt?: string;
 };
@@ -76,6 +85,12 @@ type JournalContextType = {
     journalId: string,
     accommodationLocation: string,
   ) => void;
+  saveActivityMemory: (
+    journalId: string,
+    dayId: string,
+    activityId: string,
+    memory?: ActivityMemory,
+  ) => Promise<MemoryPhoto | undefined>;
   saveReplannedDays: (expected: TravelJournal, days: JournalDay[]) => Promise<void>;
   deleteJournal: (id: string) => void;
   getJournal: (id: string) => TravelJournal | undefined;
@@ -104,7 +119,23 @@ type JournalContextType = {
   ) => void;
 };
 
-const SAMPLE_JOURNAL: TravelJournal = {
+const SAMPLE_COMPLETED_IDS = new Set(["v1-1", "v1-3", "v1-5", "v2-2", "v2-3", "v3-1"]);
+
+function seedSampleVisits(journal: TravelJournal): TravelJournal {
+  return {
+    ...journal,
+    days: journal.days.map((day) => ({
+      ...day,
+      activities: day.activities.map((activity) =>
+        SAMPLE_COMPLETED_IDS.has(activity.id) && !activity.completed && !activity.actualStartAt
+          ? { ...activity, completed: true }
+          : activity,
+      ),
+    })),
+  };
+}
+
+const SAMPLE_JOURNAL: TravelJournal = seedSampleVisits({
   id: "varanasi-sample",
   title: "Varanasi Diaries",
   destination: "Varanasi, Uttar Pradesh, India",
@@ -290,7 +321,7 @@ const SAMPLE_JOURNAL: TravelJournal = {
       ],
     },
   ],
-};
+});
 
 function createJournalDays(startDate: string, endDate: string): JournalDay[] {
   const [startYear, startMonth, startDay] = startDate.split("-").map(Number);
@@ -351,8 +382,16 @@ type JournalProviderProps = {
 };
 
 export function JournalProvider({ children }: JournalProviderProps) {
-  const [journals, setJournals] = useState<TravelJournal[]>([SAMPLE_JOURNAL]);
+  const [journals, setJournalState] = useState<TravelJournal[]>([SAMPLE_JOURNAL]);
   const [isLoading, setIsLoading] = useState(true);
+  const latestJournals = useRef(journals);
+  const storageQueue = useRef<Promise<void>>(Promise.resolve());
+  const storedJournals = useRef<TravelJournal[]>([]);
+  const setJournals = useCallback((update: (current: TravelJournal[]) => TravelJournal[]) => {
+    const next = update(latestJournals.current);
+    latestJournals.current = next;
+    setJournalState(next);
+  }, []);
 
   useEffect(() => {
     async function loadJournals() {
@@ -361,42 +400,41 @@ export function JournalProvider({ children }: JournalProviderProps) {
 
         if (savedData) {
           const savedJournals: TravelJournal[] = JSON.parse(savedData);
-          const migratedJournals = savedJournals.map(migrateJournal);
+          const migratedJournals = savedJournals.map((saved) => {
+            const journal = migrateJournal(saved);
+            return journal.isSample && journal.id === SAMPLE_JOURNAL.id
+              ? seedSampleVisits(journal)
+              : journal;
+          });
 
           const hasSample = migratedJournals.some(
             (journal) => journal.id === SAMPLE_JOURNAL.id,
           );
 
           setJournals(
-            hasSample
+            () => hasSample
               ? migratedJournals
               : [SAMPLE_JOURNAL, ...migratedJournals],
           );
         } else {
-          setJournals([SAMPLE_JOURNAL]);
+          setJournals(() => [SAMPLE_JOURNAL]);
         }
       } catch (error) {
         console.error("Could not load journals:", error);
-        setJournals([SAMPLE_JOURNAL]);
+        setJournals(() => [SAMPLE_JOURNAL]);
       } finally {
         setIsLoading(false);
       }
     }
 
     loadJournals();
-  }, []);
-
-  const latestJournals = useRef(journals);
-  const storageQueue = useRef<Promise<void>>(Promise.resolve());
-
-  useLayoutEffect(() => {
-    latestJournals.current = journals;
-  }, [journals]);
+  }, [setJournals]);
 
   function persist(snapshot: TravelJournal[]) {
-    const write = storageQueue.current.then(() => {
-      if (latestJournals.current !== snapshot) return;
-      return AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+    const write = storageQueue.current.then(async () => {
+      if (latestJournals.current !== snapshot || storedJournals.current === snapshot) return;
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+      storedJournals.current = snapshot;
     });
     storageQueue.current = write.catch(() => undefined);
     return write;
@@ -404,43 +442,76 @@ export function JournalProvider({ children }: JournalProviderProps) {
 
   useEffect(() => {
     if (isLoading) return;
-    persist(journals).catch((error) => {
-      console.error("Could not save journals:", error);
-    });
+    persist(journals)
+      .then(() => {
+        if (storedJournals.current === journals && latestJournals.current === journals) {
+          return syncActivityReminders(journals);
+        }
+      })
+      .catch((error) => console.error("Could not save journals or synchronize activity reminders:", error));
   }, [journals, isLoading]);
 
-  async function saveReplannedDays(expected: TravelJournal, days: JournalDay[]) {
+  async function saveJournalDays(expected: TravelJournal, days: JournalDay[]) {
     const proposed = { ...expected, days };
     // Check the current journal after earlier writes have settled.
     const write = storageQueue.current.then(async () => {
       const snapshot = latestJournals.current;
       if (!snapshot.includes(expected)) {
-        throw new Error("The itinerary changed. Discard this preview and replan again.");
+        throw new Error("The saved journal changed. Close this view and try again.");
       }
       const next = snapshot.map((journal) => journal === expected ? proposed : journal);
       try {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
       } catch {
-        throw new Error("The itinerary could not be saved. Try again.");
+        throw new Error("The journal could not be saved. Try again.");
       }
       if (!latestJournals.current.includes(expected)) {
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(latestJournals.current));
-        throw new Error("The itinerary changed. Discard this preview and replan again.");
+        const current = latestJournals.current;
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(current));
+        storedJournals.current = current;
+        throw new Error("The saved journal changed. Close this view and try again.");
       }
-      setJournals((current) => current.map((journal) => journal === expected ? proposed : journal));
+      storedJournals.current = next;
+      setJournals((current) => current === snapshot ? next :
+        current.map((journal) => journal === expected ? proposed : journal));
     });
     storageQueue.current = write.catch(() => undefined);
     await write;
   }
 
-  // Keep native activity reminders synchronized with saved journals.
+  async function saveActivityMemory(
+    journalId: string,
+    dayId: string,
+    activityId: string,
+    memory?: ActivityMemory,
+  ): Promise<MemoryPhoto | undefined> {
+    const journal = latestJournals.current.find((item) => item.id === journalId);
+    const day = journal?.days.find((item) => item.id === dayId);
+    const activity = day?.activities.find((item) => item.id === activityId);
+    if (!journal || !day || !activity ||
+        (memory && !activity.memory && (!activity.completed || !activity.location?.trim()))) {
+      throw new Error("This completed activity is unavailable. Close the editor and try again.");
+    }
+
+    const updatedActivity = { ...activity, memory };
+    const updatedDay = {
+      ...day,
+      activities: day.activities.map((item) => item.id === activityId ? updatedActivity : item),
+    };
+    await saveJournalDays(journal, journal.days.map((item) => item.id === dayId ? updatedDay : item));
+    return activity.memory?.photo;
+  }
+
   useEffect(() => {
     if (isLoading || Platform.OS === "web") return;
-
-    syncActivityReminders(journals).catch((error) => {
-      console.error("Could not synchronize activity reminders:", error);
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active" || storedJournals.current !== latestJournals.current) return;
+      syncActivityReminders(storedJournals.current).catch((error) => {
+        console.error("Could not synchronize activity reminders:", error);
+      });
     });
-  }, [journals, isLoading]);
+    return () => subscription.remove();
+  }, [isLoading]);
 
   function addJournal(journal: NewJournal) {
     const newJournal: TravelJournal = {
@@ -534,7 +605,7 @@ export function JournalProvider({ children }: JournalProviderProps) {
     dayId: string,
     activityId: string,
   ): boolean {
-    const journal = journals.find((item) => item.id === journalId);
+    const journal = latestJournals.current.find((item) => item.id === journalId);
     if (!journal) return false;
 
     const day = journal.days.find((item) => item.id === dayId);
@@ -631,7 +702,8 @@ export function JournalProvider({ children }: JournalProviderProps) {
     updateJournal,
     updateAccommodationLocation,
     deleteJournal,
-    saveReplannedDays,
+    saveActivityMemory,
+    saveReplannedDays: saveJournalDays,
     getJournal,
     updateActivity,
     startActivity,

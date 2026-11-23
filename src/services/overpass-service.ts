@@ -131,17 +131,34 @@ function deduplicatePlaces(places: NearbyPlace[]) {
   return unique;
 }
 
-export async function findNearbyLandmarks(coordinates: UserCoordinates) {
+export async function searchNearbyPlaces(
+  coordinates: UserCoordinates,
+  {
+    radii = [50, 100, 200],
+    excludedNames,
+    minimumResults = 3,
+    requests,
+  }: {
+    radii?: number[];
+    excludedNames?: ReadonlySet<string>;
+    minimumResults?: number;
+    requests?: Map<string, Promise<NearbyPlace[]>>;
+  } = {},
+) {
   const found = new Map<string, NearbyPlace>();
   let searchError: string | undefined;
 
-  for (const radius of [50, 100, 200]) {
+  for (const radius of radii) {
     try {
-      const places = await getNearbyPlaces(coordinates, radius);
+      const key = `${coordinates.latitude},${coordinates.longitude},${radius}`;
+      const request = requests?.get(key) ?? getNearbyPlaces(coordinates, radius);
+      requests?.set(key, request);
+      const places = await request;
       for (const place of places) {
+        if (place.distance > radius || excludedNames?.has(place.name.trim().toLowerCase())) continue;
         found.set(`${place.osmType}/${place.id}`, place);
       }
-      if (found.size >= 3) break;
+      if (deduplicatePlaces([...found.values()]).length >= minimumResults) break;
     } catch (error) {
       searchError = error instanceof Error ? error.message : "Nearby places are temporarily unavailable.";
       break;
@@ -151,6 +168,11 @@ export async function findNearbyLandmarks(coordinates: UserCoordinates) {
   const places = deduplicatePlaces(
     [...found.values()].sort((first, second) => first.distance - second.distance),
   );
+  return { places, searchError };
+}
+
+export async function findNearbyLandmarks(coordinates: UserCoordinates) {
+  const { places, searchError } = await searchNearbyPlaces(coordinates);
   if (places.length) return { places, message: searchError, hasMapData: true };
 
   const area = await reverseGeocodeLocation(coordinates).catch(() => null);

@@ -1,26 +1,33 @@
 import * as Notifications from "expo-notifications";
+import { AndroidImportance, IosAuthorizationStatus } from "expo-notifications";
+import { Platform } from "react-native";
 
-import type {
-    JournalActivity,
-    JournalDay,
-    TravelJournal,
-} from "@/context/journal-context";
+import type { TravelJournal } from "@/context/journal-context";
+import { getTimeInMinutes } from "@/services/replanning/trip-optimizer";
 
 const REMINDER_MINUTES = 5;
+const CHANNEL_ID = "activity-reminders";
+const REMINDER_TITLE = "Upcoming activity";
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowBanner: true,
-    shouldShowList: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
-});
+if (Platform.OS !== "web") {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowBanner: true,
+      shouldShowList: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+    }),
+  });
+}
 
-// Kept as an exported function so existing imports continue to work.
-// Custom Android channel creation is intentionally avoided in Expo Go.
 export async function initializeNotifications(): Promise<void> {
-  return;
+  if (Platform.OS === "android") {
+    await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
+      name: "Activity reminders",
+      importance: AndroidImportance.HIGH,
+      sound: "default",
+    });
+  }
 }
 
 export async function requestNotificationPermission(): Promise<boolean> {
@@ -28,13 +35,10 @@ export async function requestNotificationPermission(): Promise<boolean> {
 
   const currentPermission = await Notifications.getPermissionsAsync();
 
-  if (currentPermission.granted) {
-    return true;
-  }
-
-  const requestedPermission = await Notifications.requestPermissionsAsync();
-
-  return requestedPermission.granted;
+  if (currentPermission.granted ||
+      currentPermission.ios?.status === IosAuthorizationStatus.PROVISIONAL) return true;
+  if (!currentPermission.canAskAgain) return false;
+  return (await Notifications.requestPermissionsAsync()).granted;
 }
 
 export function getScheduledActivityDate(
@@ -49,34 +53,15 @@ export function getScheduledActivityDate(
   const month = Number(dateMatch[2]);
   const day = Number(dateMatch[3]);
 
-  const timeMatch = /^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i.exec(time.trim());
-
-  if (!timeMatch) return null;
-
-  let hours = Number(timeMatch[1]);
-  const minutes = Number(timeMatch[2]);
-  const meridiem = timeMatch[3]?.toUpperCase();
-
-  if (minutes > 59) return null;
-
-  if (meridiem) {
-    if (hours < 1 || hours > 12) return null;
-
-    if (meridiem === "AM" && hours === 12) {
-      hours = 0;
-    } else if (meridiem === "PM" && hours !== 12) {
-      hours += 12;
-    }
-  } else if (hours > 23) {
-    return null;
-  }
-
-  const scheduledDate = new Date(year, month - 1, day, hours, minutes, 0, 0);
+  const timeMinutes = getTimeInMinutes(time);
+  if (timeMinutes === null) return null;
+  const scheduledDate = new Date(year, month - 1, day, Math.floor(timeMinutes / 60), timeMinutes % 60, 0, 0);
 
   if (
     scheduledDate.getFullYear() !== year ||
     scheduledDate.getMonth() !== month - 1 ||
-    scheduledDate.getDate() !== day
+    scheduledDate.getDate() !== day ||
+    scheduledDate.getHours() * 60 + scheduledDate.getMinutes() !== timeMinutes
   ) {
     return null;
   }
@@ -84,95 +69,80 @@ export function getScheduledActivityDate(
   return scheduledDate;
 }
 
-type ActivityReminder = {
-  journal: TravelJournal;
-  day: JournalDay;
-  activity: JournalActivity;
-};
+async function reconcileActivityReminders(journals: TravelJournal[]): Promise<void> {
+  const now = Date.now();
+  const desired = new Map<string, {
+    body: string;
+    reminderAt: number;
+    journalId: string;
+    dayId: string;
+    activityId: string;
+  }>();
+  for (const journal of journals) {
+    if (journal.isSample) continue;
+    for (const day of journal.days) {
+      for (const activity of day.activities) {
+        if (activity.completed || activity.actualStartAt || activity.actualEndAt) continue;
+        const scheduled = getScheduledActivityDate(day.date, activity.time);
+        if (!scheduled) continue;
+        const reminderAt = scheduled.getTime() - REMINDER_MINUTES * 60_000;
+        if (scheduled.getTime() <= now) continue;
+        const { id: journalId } = journal;
+        const { id: dayId } = day;
+        const { id: activityId } = activity;
+        const key = `offmap:activity:${JSON.stringify([journalId, dayId, activityId])}`;
+        const body = `${activity.title} starts at ${activity.time}.`;
+        desired.set(key, { body, reminderAt, journalId, dayId, activityId });
+      }
+    }
+  }
 
-async function cancelExistingActivityReminders(): Promise<void> {
-  const scheduledNotifications =
-    await Notifications.getAllScheduledNotificationsAsync();
+  const notificationRequests = await Notifications.getAllScheduledNotificationsAsync();
+  const hasFutureReminders = [...desired.values()].some((item) => item.reminderAt > now);
+  const exact = Platform.OS === "android" && hasFutureReminders &&
+    await Notifications.getExactAlarmPermissionsAsync().then(({ granted }) => granted).catch(() => false);
+  for (const pending of notificationRequests) {
+    const { content, identifier } = pending;
+    if (content.data?.offmapActivityReminder !== true) continue;
+    const reminder = desired.get(identifier);
+    if (reminder && reminder.reminderAt === Number(content.data.reminderAt) &&
+        content.title === REMINDER_TITLE && content.body === reminder.body &&
+        (reminder.reminderAt <= now || content.data.exact === exact)) {
+      desired.delete(identifier);
+    } else {
+      try {
+        await Notifications.cancelScheduledNotificationAsync(identifier);
+      } catch (error) {
+        desired.delete(identifier);
+        console.error("Could not cancel an activity reminder:", error);
+      }
+    }
+  }
 
-  const offmapReminders = scheduledNotifications.filter(
-    (notification) =>
-      notification.content.data?.offmapActivityReminder === true,
-  );
+  if (![...desired.values()].some((item) => item.reminderAt > Date.now()) ||
+      !await requestNotificationPermission()) return;
 
-  await Promise.all(
-    offmapReminders.map((notification) =>
-      Notifications.cancelScheduledNotificationAsync(notification.identifier),
-    ),
-  );
-}
-
-async function rebuildActivityReminders(
-  journals: TravelJournal[],
-): Promise<void> {
-  const reminders: ActivityReminder[] = [];
-
-  journals.forEach((journal) => {
-    // Sample journals are demonstrations, not real user itineraries.
-    if (journal.isSample) return;
-
-    journal.days.forEach((day) => {
-      day.activities.forEach((activity) => {
-        if (activity.completed || activity.actualEndAt) return;
-
-        const scheduledDate = getScheduledActivityDate(day.date, activity.time);
-
-        if (!scheduledDate) return;
-
-        const reminderDate = new Date(
-          scheduledDate.getTime() - REMINDER_MINUTES * 60 * 1000,
-        );
-
-        // Do not schedule reminders whose five-minute warning
-        // time has already passed.
-        if (reminderDate.getTime() <= Date.now()) return;
-
-        reminders.push({ journal, day, activity });
-      });
-    });
-  });
-
-  // Remove previous OFFMAP reminders before rebuilding them.
-  await cancelExistingActivityReminders();
-
-  if (reminders.length === 0) return;
-
-  const permissionGranted = await requestNotificationPermission();
-
-  if (!permissionGranted) return;
-
-  for (const reminder of reminders) {
-    const scheduledDate = getScheduledActivityDate(
-      reminder.day.date,
-      reminder.activity.time,
-    );
-
-    if (!scheduledDate) continue;
-
-    const reminderDate = new Date(
-      scheduledDate.getTime() - REMINDER_MINUTES * 60 * 1000,
-    );
-
+  const writes = await Promise.allSettled([...desired].map(async ([identifier, { body, ...reminder }]) => {
+    // An activity saved within the five-minute window stays startable without a late reminder.
+    if (reminder.reminderAt <= Date.now()) return;
     await Notifications.scheduleNotificationAsync({
+      identifier,
       content: {
-        title: "Your activity starts in 5 minutes!",
-        body: `${reminder.activity.title} starts at ${reminder.activity.time}. Get ready!`,
-        data: {
-          offmapActivityReminder: true,
-          journalId: reminder.journal.id,
-          dayId: reminder.day.id,
-          activityId: reminder.activity.id,
-        },
+        title: REMINDER_TITLE,
+        body,
+        sound: "default",
+        data: { ...reminder, offmapActivityReminder: true, exact },
       },
       trigger: {
         type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: reminderDate,
+        date: new Date(reminder.reminderAt),
+        channelId: CHANNEL_ID,
+        ...(exact ? { delivery: "alarmClock" as const } : {}),
       },
     });
+  }));
+  for (const write of writes) {
+    if (write.status === "rejected") console.error("Could not schedule an activity reminder:", write.reason);
   }
 }
 
@@ -181,14 +151,12 @@ let reminderSyncQueue: Promise<void> = Promise.resolve();
 export function syncActivityReminders(
   journals: TravelJournal[],
 ): Promise<void> {
+  if (Platform.OS === "web") return Promise.resolve();
   reminderSyncQueue = reminderSyncQueue
     .catch((error) => {
       console.error("Previous reminder synchronization failed:", error);
     })
-    .then(() => rebuildActivityReminders(journals))
-    .catch((error) => {
-      console.error("Could not synchronize activity reminders:", error);
-    });
+    .then(() => reconcileActivityReminders(journals));
 
   return reminderSyncQueue;
 }

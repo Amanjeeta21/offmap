@@ -14,6 +14,7 @@
     },
     "android": {
       "package": "com.amanjeeta.offmap",
+      "permissions": ["android.permission.SCHEDULE_EXACT_ALARM"],
       "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
@@ -42,6 +43,14 @@
         "expo-location",
         {
           "locationWhenInUsePermission": "Allow OFFMAP to access your location to find nearby landmarks and plan your itinerary from your current position."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow OFFMAP to select photos for your travel journals and memories.",
+          "cameraPermission": "Allow OFFMAP to take photos for your travel memories.",
+          "microphonePermission": false
         }
       ],
       "expo-status-bar",

@@ -1,4 +1,5 @@
 import type { JournalActivity } from "@/context/journal-context";
+import type { NearbyPlace } from "@/services/overpass-service";
 
 /**
  * A time window during which a place is available.
@@ -147,7 +148,11 @@ export type TripDayProposal = {
   warnings: string[];
   isFeasible: boolean;
   returnTravel?: TravelTimeData;
-  alternatives?: AlternativePlace[];
+  alternatives?: {
+    activityId: string;
+    place: NearbyPlace;
+    itinerary: TripDayProposal;
+  }[];
 };
 
 /**
@@ -191,6 +196,7 @@ export type TripReplanningInput = {
     travelTimes: TravelTimeData[];
     routeOrigins: Record<string, string>;
     warnings: string[];
+    startingLocationId?: string;
   }>;
   currentDate: string;
   currentTime: string;

@@ -3,6 +3,7 @@ import { geocodeLocation } from "@/services/geocoding-service";
 import { getCurrentLocation, type UserCoordinates } from "@/services/location-service";
 import { getTravelTimeMatrix, type TravelLocation } from "@/services/osrm-service";
 import type { TravelTimeData } from "@/types/replanning";
+import { getActivityRouteLocation, getTimeInMinutes } from "./trip-optimizer";
 
 export const STARTING_LOCATION_ID = "__current_location__";
 
@@ -21,7 +22,7 @@ type TravelOptions = {
   geocodingRequests?: Map<string, ReturnType<typeof geocodeLocation>>;
 };
 
-function parseActivityLocation(location: string) {
+export function parseActivityLocation(location: string) {
   const original = location.trim();
   const parts = original.split(/\s+(?:to|\u2192|->)\s+/i).map((part) => part.trim());
   if (parts.length === 2 && parts[0] && parts[1]) {
@@ -65,9 +66,10 @@ export async function getDayTravelData(
   }
 
   for (const activity of activities) {
-    const { original, destination, routeOrigin } = parseActivityLocation(activity.location);
+    const alternative = activity.plannedAlternative;
+    const { original, destination, routeOrigin } = parseActivityLocation(getActivityRouteLocation(activity));
     if (!destination) continue;
-    const coordinates = await resolve(destination);
+    const coordinates = alternative ?? await resolve(destination);
     if (coordinates) {
       travelLocations.set(original, { id: original, coordinates });
       resolvedLocations.push({
@@ -106,6 +108,11 @@ export async function getDayTravelData(
     routeOrigins,
     warnings,
     startingCoordinates: travelLocations,
+    startingLocationId: [...activities]
+      .sort((first, second) => (getTimeInMinutes(first.time) ?? Infinity) - (getTimeInMinutes(second.time) ?? Infinity))
+      .map((activity) => getActivityRouteLocation(activity))
+      .map((location) => routeOrigins[location] ?? location)
+      .find((location) => travelLocations.has(location)),
   };
 }
 

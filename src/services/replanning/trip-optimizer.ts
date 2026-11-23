@@ -1,3 +1,4 @@
+import type { JournalActivity } from "@/context/journal-context";
 import type {
   ReplanningActivity,
   TravelTimeData,
@@ -11,6 +12,11 @@ import { parseDurationToMinutes } from "./delay-detector";
 
 const MINUTES_IN_DAY = 24 * 60;
 const DEFAULT_DAY_START = 8 * 60;
+
+export function getActivityRouteLocation(activity: { location?: string; plannedAlternative?: JournalActivity["plannedAlternative"] }) {
+  const place = activity.plannedAlternative;
+  return place ? `alternative:${place.osmType ?? "place"}/${place.id}` : activity.location?.trim() ?? "";
+}
 
 type Visit = {
   proposal: TripActivityProposal;
@@ -36,7 +42,7 @@ function formatTime(time: number): string {
 }
 
 function fitsOpeningHours(activity: ReplanningActivity, start: number, end: number) {
-  if (!activity.openingHours?.length) return true;
+  if (activity.plannedAlternative || !activity.openingHours?.length) return true;
   return activity.openingHours.some(({ opensAt, closesAt }) => {
     const opens = getTimeInMinutes(opensAt);
     const closes = getTimeInMinutes(closesAt);
@@ -86,9 +92,9 @@ function optimizeDay(
 
   const today = day.date === input.currentDate;
   const currentTime = getTimeInMinutes(input.currentTime) ?? 0;
-  const earliest = proposals.find((item) => item.activity.location.trim());
-  const firstDestination = earliest?.activity.location.trim() ?? "";
-  const firstLocation = data?.routeOrigins[firstDestination] ?? firstDestination;
+  const earliest = proposals.find((item) => getActivityRouteLocation(item.activity));
+  const firstDestination = earliest ? getActivityRouteLocation(earliest.activity) : "";
+  const firstLocation = data?.startingLocationId ?? data?.routeOrigins[firstDestination] ?? firstDestination;
   const futureStart = Math.min(DEFAULT_DAY_START, Math.max(0,
     (getTimeInMinutes(earliest?.proposedTime ?? "") ?? DEFAULT_DAY_START) - 60,
   ));
@@ -107,7 +113,7 @@ function optimizeDay(
     const { activity, status } = proposal;
     const plannedTime = getTimeInMinutes(activity.time);
     const duration = parseDurationToMinutes(activity.duration);
-    const destination = activity.location.trim();
+    const destination = getActivityRouteLocation(activity);
     const origin = data?.routeOrigins[destination] ?? destination;
 
     if (status === "completed") continue;
@@ -198,7 +204,7 @@ function optimizeDay(
       const earliestStart = (before?.end ?? startAt) + inbound.durationMinutes;
       const latestStart = (after?.start ?? latest) - outbound.durationMinutes - duration;
       const activity = visit.proposal.activity;
-      const openings = (activity.openingHours ?? []).map((window) =>
+      const openings = (activity.plannedAlternative ? [] : activity.openingHours ?? []).map((window) =>
         getTimeInMinutes(window.opensAt) ?? MINUTES_IN_DAY,
       );
       const candidates = preferOriginal ? [visit.start] : [earliestStart, ...openings].sort((a, b) => a - b);

@@ -127,6 +127,9 @@ export default function ItineraryScreen() {
                           <View style={styles.scheduleActivity}>
                             <Text style={styles.scheduleActivityTitle}>{activity.title}</Text>
                             {activity.location ? <Text style={styles.scheduleDate}>{activity.location}</Text> : null}
+                            {activity.plannedAlternative ? (
+                              <Text style={styles.scheduleDate}>Planned alternative / {activity.plannedAlternative.name}</Text>
+                            ) : null}
                           </View>
                         </View>
                       )) : <Text style={styles.scheduleDate}>No activities planned for this day.</Text>}
